@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lazygerrit"
+version = "0.1.0"
+description = "A lazygit-style terminal UI for Gerrit, tuned for the src repository on gerrit.cicd.autoheim.net"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+lazygerrit = "lazygerrit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lazygerrit*"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py310"
