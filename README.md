@@ -1,3 +1,5 @@
+THIS IS 100% CLANKED. USE AT YOUR OWN RISK
+
 # lazygerrit
 
 A [lazygit](https://github.com/jesseduffield/lazygit)-style terminal UI for Gerrit, tuned for the
