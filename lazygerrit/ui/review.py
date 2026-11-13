@@ -12,11 +12,11 @@ from .. import operations as ops
 from ..diff import LineRef, file_as_added, parse_unified, unified_text_diff
 from ..drafts import Draft
 from ..models import COMMIT_MSG, PATCHSET_LEVEL, Change, FileInfo, PatchSet, Thread
-from ..renderers import BUILTIN, DiffRenderer
+from ..renderers import BUILTIN, DiffRenderer, run_highlighter
 from ..renderers import render as render_with
 from . import render, theme
 from .render import first_line
-from .text import PLAIN, Line, ansi_to_lines, plain, text_block
+from .text import PLAIN, Line, Style, ansi_to_lines, plain, strip_ansi, text_block
 from .widgets import MenuItem, ReviewPopup
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -25,6 +25,22 @@ if TYPE_CHECKING:  # pragma: no cover
 FULL_FILE_CONTEXT = 1_000_000
 CODE_REVIEW = ("Code-Review", [-2, -1, 0, 1, 2])
 SECONDARY_REVIEW = ("Secondary-Review", [-1, 0, 1])
+
+
+def highlight(
+    git: Any, command: Optional[str], diff: str, rows: list, scheme: str
+) -> tuple[dict[int, tuple[Line, Optional[Style]]], str]:
+    """Syntax highlighting for the review view (runs in a worker): (styles for diff_lines, problem)."""
+    if not command or not rows:
+        return {}, ""
+    status, colored = run_highlighter(git, command, diff, color_scheme=scheme)
+    if status:
+        why = next((ln.strip() for ln in strip_ansi(colored).splitlines() if ln.strip()), f"exit status {status}")
+        return {}, f"No syntax highlighting: {command} failed: {why}"
+    styles = render.highlight_rows(rows, diff, colored)
+    if not styles and any(r.kind in ("add", "del", "ctx") for r in rows):
+        return {}, f"No syntax highlighting: {command} changed the diff's lines (use a filter like delta --color-only)"
+    return styles, ""
 
 
 def thread_key(t: Thread) -> tuple:
@@ -250,23 +266,32 @@ class ReviewMixin:
             self.set_main(key, title, [[(note, theme.DIM)]], wrap=False)
         context = FULL_FILE_CONTEXT if self.full_file else self.diff_context
 
-        def work() -> list:
+        highlighter, scheme = self.syntax_command, self.color_scheme
+
+        def work() -> tuple[list, dict[int, tuple[Line, Optional[Style]]], str]:
             git.ensure_commit(view.revision, view.ref)
             if base is not None:
                 git.ensure_commit(base.revision, base.ref)
             if f.path == COMMIT_MSG:
                 new = git.commit_message_file(view.revision)
                 if base is None:
-                    return file_as_added(new)
-                return unified_text_diff(git.commit_message_file(base.revision), new, min(context, 10_000))
+                    return file_as_added(new), {}, ""
+                return unified_text_diff(git.commit_message_file(base.revision), new, min(context, 10_000)), {}, ""
             if f.path.startswith("/"):
-                return []
+                return [], {}, ""
             base_rev = base.revision if base is not None else (view.parents[0] if view.parents else f"{view.revision}^")
             paths = [f.path] + ([f.old_path] if f.old_path and f.old_path != f.path else [])
-            return parse_unified(git.diff(base_rev, view.revision, paths, context))
+            diff = git.diff(base_rev, view.revision, paths, context)
+            rows = parse_unified(diff)
+            return (rows, *highlight(git, highlighter, diff, rows, scheme))
 
-        def done(rows: list) -> None:
+        def done(result: tuple[list, dict[int, tuple[Line, Optional[Style]]], str]) -> None:
+            rows, styles, problem = result
             self.diff_rows[key] = rows
+            self.diff_styles[key] = styles
+            if problem and not self.syntax_warned:
+                self.syntax_warned = True
+                self.show_toast(problem, error=True, seconds=10)
             if self.main_key == key:
                 self._render_diff(key)
 
@@ -312,6 +337,7 @@ class ReviewMixin:
             new_ps=view_n,
             base_ps=base_n or None,
             notes=notes,
+            styled=self.diff_styles.get(key),
         )
         title = self._diff_title(key)
         first = self.rendered_diff != key

@@ -6,7 +6,7 @@ import calendar
 import difflib
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Sequence
 
 from .. import __version__
@@ -24,7 +24,22 @@ from ..models import (
 )
 from ..parsing import ci_state, format_duration_ms, is_ci_comment
 from . import theme
-from .text import PLAIN, Line, Style, pad_str, plain, sanitize, text_width, truncate_str, wrap
+from .text import (
+    DEFAULT_COLOR,
+    PLAIN,
+    Line,
+    Style,
+    ansi_to_lines,
+    drop_first_char,
+    line_width,
+    pad_str,
+    plain,
+    sanitize,
+    strip_ansi,
+    text_width,
+    truncate_str,
+    wrap,
+)
 
 VOTE_GLYPH_OK = "✓"
 VOTE_GLYPH_BAD = "✗"
@@ -934,6 +949,33 @@ def intraline(old: str, new: str) -> Optional[tuple[list[tuple[int, int]], list[
     return ra, rb
 
 
+def highlight_rows(rows: Sequence[DiffRow], diff: str, colored: str) -> dict[int, tuple[Line, Optional[Style]]]:
+    """Colors for the code of ``rows`` from ``colored``, which is the unified ``diff`` they were parsed
+    from passed through a highlighter that keeps every line (e.g. ``delta --color-only``).
+
+    Returns {row index: (the code's spans without the +/- marker, background of the whole line)}.
+    Lines whose text the highlighter changed are left out, so they are shown as usual.
+    """
+    raw_lines = diff.split("\n")
+    out_lines = colored.split("\n")
+    styles: dict[int, tuple[Line, Optional[Style]]] = {}
+    if diff.rstrip("\n").count("\n") != strip_ansi(colored).rstrip("\n").count("\n"):
+        return styles  # not line for line: matching lines up would be guesswork
+    for i, r in enumerate(rows):
+        if r.kind not in ("add", "del", "ctx") or not 0 <= r.src < min(len(raw_lines), len(out_lines)):
+            continue
+        raw, out = raw_lines[r.src], out_lines[r.src]
+        if raw[:1] not in ("+", "-", " "):
+            continue
+        body = (ansi_to_lines(drop_first_char(out)) or [[]])[0]
+        if plain(body) != sanitize(raw[1:]):
+            continue
+        head = (ansi_to_lines(out) or [[]])[0]
+        bg = head[0][1].bg if head else DEFAULT_COLOR
+        styles[i] = (body, Style(bg=bg) if bg != DEFAULT_COLOR else None)
+    return styles
+
+
 def emphasize(text: str, ranges: Sequence[tuple[int, int]], base: Style, emph: Style) -> Line:
     out: Line = []
     pos = 0
@@ -990,8 +1032,11 @@ def diff_lines(
     new_ps: int = 0,
     base_ps: Optional[int] = None,
     notes: Sequence[Line] = (),
+    styled: Optional[dict[int, tuple[Line, Optional[Style]]]] = None,
 ) -> tuple[list[Line], list[Any]]:
     """Render diff rows with line numbers, intraline highlights, comment threads and drafts.
+
+    ``styled`` (from highlight_rows) replaces the coloring of code lines, e.g. with syntax highlighting.
 
     ``threads`` belong to ``new_ps`` (REVISION side on the right, PARENT side on the left when the
     base is the parent commit); ``threads_old`` belong to ``base_ps`` and are shown on the left.
@@ -1093,21 +1138,26 @@ def diff_lines(
             o = str(r.old) if r.old is not None else ""
             n = str(r.new) if r.new is not None else ""
             gutter = (f"{o:>{nw}} {n:>{nw}} ", theme.DIM)
+            hl = styled.get(idx) if styled else None
+            fill = hl[1] if hl else None
             if r.kind == "add":
-                body = emphasize(text, emph.get(idx, []), theme.OK, ADD_EMPH)
-                out.append([gutter, ("+", theme.OK)] + body)
+                body = hl[0] if hl else emphasize(text, emph.get(idx, []), theme.OK, ADD_EMPH)
+                ln = [gutter, ("+", replace(theme.OK, bg=fill.bg) if fill else theme.OK)] + body
                 meta.append(LineRef(path, r.new or 0, None, new_ps, len(text)))
             elif r.kind == "del":
-                body = emphasize(text, emph.get(idx, []), theme.BAD, DEL_EMPH)
-                out.append([gutter, ("-", theme.BAD)] + body)
+                body = hl[0] if hl else emphasize(text, emph.get(idx, []), theme.BAD, DEL_EMPH)
+                ln = [gutter, ("-", replace(theme.BAD, bg=fill.bg) if fill else theme.BAD)] + body
                 if base_ps is not None:
                     # Left side of a patch set comparison: that file as it is in the older patch set.
                     meta.append(LineRef(old_path or path, r.old or 0, None, base_ps, len(text)))
                 else:
                     meta.append(LineRef(path, r.old or 0, "PARENT", new_ps, len(text)))
             else:
-                out.append([gutter, (" " + text, PLAIN)])
+                ln = [gutter, (" ", PLAIN)] + hl[0] if hl else [gutter, (" " + text, PLAIN)]
                 meta.append(LineRef(path, r.new or 0, None, new_ps, len(text)))
+            if fill is not None and line_width(ln) < width:
+                ln.append((" " * (width - line_width(ln)), fill))  # like the terminal's erase-to-end-of-line
+            out.append(ln)
             if r.new is not None and r.kind in ("add", "ctx") and r.new in new_anchor:
                 add_items(new_anchor[r.new])
             if r.old is not None and r.kind in ("del", "ctx") and r.old in old_anchor:

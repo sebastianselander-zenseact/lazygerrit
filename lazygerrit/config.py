@@ -69,6 +69,7 @@ class Config:
     state_file: Optional[str] = None
     diff_renderers: list[Any] = field(default_factory=list)  # renderers.DiffRenderer
     color_scheme: str = "auto"
+    syntax_highlight: Any = "auto"  # "auto" (delta if installed), "off" or a command like delta --color-only
     problems: list[str] = field(default_factory=list)
 
     @property
@@ -166,7 +167,7 @@ def _apply(cfg: Config, data: dict[str, Any]) -> None:
             setattr(cfg, key, value)
 
 
-DISPLAY_SETTINGS = {"diffrenderers", "colorscheme", "mouse", "sidepanelwidth", "nerdfonts", "diffcontext"}
+DISPLAY_SETTINGS = {"diffrenderers", "colorscheme", "syntaxhighlight", "mouse", "sidepanelwidth", "nerdfonts", "diffcontext"}
 
 
 def apply_display_settings(cfg: Config, config_file: Optional[str] = None) -> None:

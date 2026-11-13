@@ -26,7 +26,7 @@ from ..drafts import Draft, StateStore
 from ..gerrit import CommandError, CommandEvent, RestError
 from ..models import COMMIT_MSG, Account, Change, CIJob, FileInfo, LocalCommit, Thread
 from ..parsing import ci_messages, ci_state, filter_threads, latest_report, threads_from_change
-from ..renderers import BUILTIN, DiffRenderer, detect_color_scheme
+from ..renderers import BUILTIN, DiffRenderer, detect_color_scheme, syntax_command
 from ..srcrepo import CI_COMMANDS, discover_run_selected_jobs, known_hashtags, prio_high_hashtags
 from ..zuul import ZuulError
 from . import render, theme
@@ -190,6 +190,9 @@ class App(ReviewMixin):
         self.rendered_out: OrderedDict[tuple, Any] = OrderedDict()
         self.pending_map: Optional[tuple[Any, tuple[str, float]]] = None
         self.color_scheme = detect_color_scheme(cfg.color_scheme)
+        self.syntax_command = syntax_command(cfg.syntax_highlight)
+        self.diff_styles: dict[tuple, dict[int, Any]] = {}
+        self.syntax_warned = False
         self.bindings: list[Binding] = []
         self._build_bindings()
         self._setup_panels()

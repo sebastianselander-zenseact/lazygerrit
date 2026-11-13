@@ -15,6 +15,7 @@ class DiffRow:
     text: str
     old: Optional[int] = None
     new: Optional[int] = None
+    src: int = -1  # index of the line in the unified diff it was parsed from
 
 
 @dataclass(frozen=True)
@@ -40,22 +41,22 @@ def parse_unified(text: str) -> list[DiffRow]:
     rows: list[DiffRow] = []
     old = new = 0
     rem_old = rem_new = 0
-    for raw in text.split("\n"):
+    for i, raw in enumerate(text.split("\n")):
         if rem_old > 0 or rem_new > 0:
             if raw.startswith("+"):
-                rows.append(DiffRow("add", raw[1:], None, new))
+                rows.append(DiffRow("add", raw[1:], None, new, i))
                 new += 1
                 rem_new -= 1
                 continue
             if raw.startswith("-"):
-                rows.append(DiffRow("del", raw[1:], old, None))
+                rows.append(DiffRow("del", raw[1:], old, None, i))
                 old += 1
                 rem_old -= 1
                 continue
             if raw.startswith("\\"):
-                rows.append(DiffRow("nonl", raw))
+                rows.append(DiffRow("nonl", raw, src=i))
                 continue
-            rows.append(DiffRow("ctx", raw[1:] if raw.startswith(" ") else raw, old, new))
+            rows.append(DiffRow("ctx", raw[1:] if raw.startswith(" ") else raw, old, new, i))
             old += 1
             new += 1
             rem_old -= 1
@@ -67,14 +68,14 @@ def parse_unified(text: str) -> list[DiffRow]:
             rem_old = int(m.group(2)) if m.group(2) is not None else 1
             new = int(m.group(3))
             rem_new = int(m.group(4)) if m.group(4) is not None else 1
-            rows.append(DiffRow("hunk", raw))
+            rows.append(DiffRow("hunk", raw, src=i))
             continue
         if raw.startswith("\\"):
-            rows.append(DiffRow("nonl", raw))
+            rows.append(DiffRow("nonl", raw, src=i))
             continue
         if raw == "":
             continue
-        rows.append(DiffRow("meta", raw))
+        rows.append(DiffRow("meta", raw, src=i))
     return rows
 
 

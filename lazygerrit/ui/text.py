@@ -368,25 +368,54 @@ def _apply_sgr(params: str, style: Style) -> Style:
     return st
 
 
+def _expand_tabs(s: str, col: int, tab_width: int = 4) -> str:
+    """Expand the tabs of a piece of a line that starts at column ``col`` (counted like sanitize)."""
+    if "\t" not in s:
+        return s
+    out = []
+    for ch in s:
+        if ch == "\t":
+            n = tab_width - (col % tab_width)
+            out.append(" " * n)
+            col += n
+        else:
+            out.append(ch)
+            col += 1
+    return "".join(out)
+
+
 def ansi_to_lines(text: str) -> list[Line]:
     """Convert text with ANSI SGR escapes (e.g. from git/delta) into styled lines."""
     lines: list[Line] = []
     style = PLAIN
     for raw in text.split("\n"):
         cur: Line = []
-        pos = 0
-        for m in _ANSI_RE.finditer(raw):
-            if m.start() > pos:
-                cur.append((sanitize(raw[pos : m.start()]), style))
+        pos = col = 0
+        for m in [*_ANSI_RE.finditer(raw), None]:
+            end = m.start() if m else len(raw)
+            if end > pos:
+                piece = _expand_tabs(raw[pos:end], col)
+                col += len(piece)
+                cur.append((sanitize(piece), style))
+            if m is None:
+                break
             if m.group(2) == "m" and (m.group(1) or "")[:1] not in ("<", "=", ">", "?"):
                 style = _apply_sgr(m.group(1) or "", style)
             pos = m.end()
-        if pos < len(raw):
-            cur.append((sanitize(raw[pos:]), style))
         lines.append([(t, s) for t, s in cur if t])
     if lines and not lines[-1]:
         lines.pop()
     return lines
+
+
+def drop_first_char(text: str) -> str:
+    """``text`` (with ANSI escapes) without its first visible character, e.g. a diff's +/- marker."""
+    pos = 0
+    for m in _ANSI_RE.finditer(text):
+        if m.start() > pos:
+            break
+        pos = m.end()
+    return text[:pos] + text[pos + 1 :] if pos < len(text) else text
 
 
 def strip_ansi(text: str) -> str:

@@ -4,7 +4,7 @@ from lazygerrit.diff import LineRef, file_as_added, parse_unified
 from lazygerrit.models import Account, Comment, Thread
 from lazygerrit.ui import render
 from lazygerrit.ui.layout import compute_layout
-from lazygerrit.ui.text import ansi_to_lines, sanitize, text_block, text_width, truncate, wrap
+from lazygerrit.ui.text import Style, ansi_to_lines, drop_first_char, plain, sanitize, text_block, text_width, truncate, wrap
 from lazygerrit.ui.widgets import ListPanel
 
 DIFF = """diff --git a/q.sql b/q.sql
@@ -48,6 +48,20 @@ class DiffTest(unittest.TestCase):
         emphasized = [[t for t, st in ln if st.bg != -1] for ln in lines if any(st.bg != -1 for _, st in ln)]
         self.assertEqual(emphasized, [["100"], ["128"]])
 
+    def test_highlighted_lines_must_match_the_diff_line_for_line(self):
+        rows = parse_unified(DIFF)
+        lines = DIFF.split("\n")
+        colored = "\n".join(
+            "\x1b[48;5;22m+\x1b[38;5;81m-- NEW comment\x1b[0m" if ln == "+-- new comment" else f"\x1b[38;5;81m{ln}\x1b[0m"
+            for ln in lines
+        )
+        styles = render.highlight_rows(rows, DIFF, colored)
+        texts = {rows[i].text: styled for i, styled in styles.items()}
+        self.assertNotIn("-- new comment", texts)  # its text was changed, so it is shown as usual
+        self.assertEqual(texts["select 1;"], ([("select 1;", Style(fg=81))], None))
+        self.assertEqual(texts["-- old comment"][1], None)
+        self.assertEqual(render.highlight_rows(rows, DIFF, "\n".join(lines[1:])), {})
+
     def test_commit_message_as_added_file(self):
         rows = file_as_added("Parent: x\n\nSubject\n")
         self.assertEqual([(r.kind, r.new) for r in rows], [("add", 1), ("add", 2), ("add", 3)])
@@ -68,6 +82,12 @@ class TextTest(unittest.TestCase):
     def test_multiline_text_never_reaches_the_terminal(self):
         self.assertEqual(sanitize("Error: x\n\n$ gerrit query"), "Error: x  $ gerrit query")
         self.assertEqual([ln[0][0] for ln in text_block("a\n\nb")], ["a", "", "b"])
+
+    def test_ansi_tabs_and_markers(self):
+        colored = "\x1b[48;5;22m+\x1b[31m\tif\x1b[0m\tx"
+        self.assertEqual(plain(ansi_to_lines(colored)[0]), sanitize("+\tif\tx"))
+        self.assertEqual(plain(ansi_to_lines(drop_first_char(colored))[0]), sanitize("\tif\tx"))
+        self.assertEqual(ansi_to_lines(colored)[0][0], ("+", Style(bg=22)))
 
     def test_ansi_colors(self):
         (ln,) = ansi_to_lines("\x1b[32m+added\x1b[0m plain \x1b[38;5;196mred\x1b[0m")

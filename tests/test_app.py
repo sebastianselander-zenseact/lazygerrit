@@ -14,19 +14,22 @@ from lazygerrit.drafts import Draft, StateStore
 from lazygerrit.renderers import DiffRenderer
 from lazygerrit.ui.app import App
 from lazygerrit.ui.screen import Key, Paste, VirtualCanvas
-from lazygerrit.ui.text import plain
+from lazygerrit.ui import render, theme
+from lazygerrit.ui.text import Style, line_width, plain
 from lazygerrit.ui.widgets import ConfirmPopup, MenuPopup, MessagePopup, PromptPopup, ReviewPopup
 
 
 class AppTestCase(unittest.TestCase):
     dry_run = False
     renderers: list = []
+    syntax = "off"
 
     def setUp(self):
         self.be, self.cfg, self.server, self.tmp = create_demo(latency=0, dry_run=self.dry_run)
         self.cfg.refresh_interval = 0
         self.cfg.zuul_refresh_interval = 0
         self.cfg.diff_renderers = [dataclasses.replace(r) for r in self.renderers]
+        self.cfg.syntax_highlight = self.syntax
         self.app = App(self.be, self.cfg, demo=True)
         self.app.canvas = VirtualCanvas(160, 45)
         self.app.start()
@@ -69,6 +72,12 @@ class AppTestCase(unittest.TestCase):
         self.select_change(number)
         self.press("4", *(["j"] * file_index), "<enter>")
         self.assertEqual(self.app.focus, "main")
+
+    def cursor_to(self, line, side=None):
+        meta = self.app.p_main.meta
+        target = next(i for i, m in enumerate(meta) if isinstance(m, LineRef) and m.line == line and m.side == side)
+        delta = target - self.app.p_main.cursor
+        self.press(*(["j"] * delta if delta > 0 else ["k"] * -delta))
 
     def upload_new_patch_set(self, number):
         ch = self.server.changes[number]
@@ -256,12 +265,6 @@ class ReviewRegressionTest(AppTestCase):
 
 
 class CodeReviewTest(AppTestCase):
-    def cursor_to(self, line, side=None):
-        meta = self.app.p_main.meta
-        target = next(i for i, m in enumerate(meta) if isinstance(m, LineRef) and m.line == line and m.side == side)
-        delta = target - self.app.p_main.cursor
-        self.press(*(["j"] * delta if delta > 0 else ["k"] * -delta))
-
     def test_range_comment(self):
         self.open_diff(100101)
         self.cursor_to(7)
@@ -558,6 +561,77 @@ class BrokenRendererTest(AppTestCase):
         self.app.renderers[0].command = "cat"
         self.press("R")
         self.assertIn("+def crop_dlt(path):", [plain(ln) for ln in self.app.p_main.lines])
+
+
+# Colors every line like delta --color-only: +/- lines on a green/red background, code in color 81.
+HIGHLIGHTER = shlex.join(
+    [
+        sys.executable,
+        "-c",
+        r"""
+import sys
+out = []
+for line in sys.stdin.read().split("\n"):
+    bg = {"+": 22, "-": 52}.get(line[:1])
+    if bg:
+        out.append(f"\x1b[48;5;{bg}m{line[0]}\x1b[38;5;81m{line[1:]}\x1b[0m\x1b[48;5;{bg}m\x1b[0K\x1b[0m")
+    elif line[:1] == " ":
+        out.append(" \x1b[38;5;81m" + line[1:] + "\x1b[0m")
+    else:
+        out.append(line)
+sys.stdout.write("\n".join(out))
+""",
+    ]
+)
+
+
+class SyntaxHighlightTest(AppTestCase):
+    syntax = HIGHLIGHTER
+
+    def code_line(self, line, side=None):
+        meta = self.app.p_main.meta
+        return self.app.p_main.lines[
+            next(i for i, m in enumerate(meta) if isinstance(m, LineRef) and m.line == line and m.side == side)
+        ]
+
+    def test_the_review_view_uses_the_highlighters_colors(self):
+        self.open_diff(100101)
+        added = self.code_line(9)
+        self.assertEqual(render.diff_code_text(added).rstrip(), "        data = fh.read()")
+        self.assertEqual(added[1], ("+", dataclasses.replace(theme.OK, bg=22)))
+        self.assertIn(("        data = fh.read()", Style(fg=81, bg=22)), added)
+        self.assertEqual(line_width(added), self.app.main_width)
+        removed = self.code_line(7, "PARENT")
+        self.assertIn(("    data = open(path).read()", Style(fg=81, bg=52)), removed)
+        context = self.code_line(6)
+        self.assertIn(("def crop(path, start, end):", Style(fg=81)), context)
+        self.assertIn("Nit: use a constant for the header size?", self.screen())
+        self.cursor_to(9)
+        self.press("c")
+        self.assertIn("crop.py:9", self.app.popups[-1].title)
+
+
+class BrokenHighlighterTest(AppTestCase):
+    syntax = "no-such-highlighter-xyz"
+
+    def test_a_failing_highlighter_is_reported_once_and_diffs_stay_plain(self):
+        self.open_diff(100101)
+        self.assertIn("No syntax highlighting: no-such-highlighter-xyz failed", self.app.toast[0])
+        line = next(
+            ln
+            for ln, m in zip(self.app.p_main.lines, self.app.p_main.meta, strict=True)
+            if isinstance(m, LineRef) and m.line == 9
+        )
+        self.assertEqual(line[1], ("+", theme.OK))
+        self.app.toast = None
+        self.press("<esc>", "<esc>")
+        self.open_diff(100102)
+        self.assertIsNone(self.app.toast)
+
+    def test_a_highlighter_that_changes_lines_is_not_used(self):
+        self.app.syntax_command = "sed 1d"
+        self.open_diff(100101)
+        self.assertIn("changed the diff's lines", self.app.toast[0])
 
 
 class DryRunAppTest(AppTestCase):

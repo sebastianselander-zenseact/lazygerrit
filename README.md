@@ -159,8 +159,8 @@ unreadable state file is moved aside to `state.json.corrupt-<time>` instead of b
    against an older patch set instead of the parent ("what changed since I last looked"). Like in
    Gerrit, a comparison lists only files that one of the two patch sets changes itself; files that
    only differ because of a rebase are left out. Comments on the left side go to the older patch set.
-2. `enter` opens the diff: line numbers, word-level highlights of what changed in a line, existing
-   comments inline, and a note when other patch sets have comments on the file.
+2. `enter` opens the diff: line numbers, syntax highlighting, word-level highlights of what changed
+   in a line, existing comments inline, and a note when other patch sets have comments on the file.
 3. Review and publish with the keys below.
 
 | Diff view key | |
@@ -189,6 +189,13 @@ file in `$EDITOR`.
 Text prompts and the review dialog: `enter` submits, `alt+enter`/`ctrl+j` inserts a newline,
 pasting multi-line text works, `ctrl+o` continues in `$EDITOR`, `tab` completes / moves between
 fields. In the review dialog, typing always goes to the message, so text can never change a vote.
+
+**Syntax highlighting**: when [delta](https://github.com/dandavison/delta) is installed, the review
+view is syntax highlighted by `delta --color-only`, a mode that only adds colors and keeps the diff
+line for line, so comments and commenting work as usual. Your delta settings apply (e.g.
+`syntax-theme` in the `[delta]` section of `~/.gitconfig`). Set `syntax_highlight = "off"` to turn it
+off, or to another command that only adds colors (like `diff-highlight`). If the command fails or
+changes the diff's lines, a message says so and diffs are shown without it.
 
 ### Diff tools (delta, difftastic, …)
 
@@ -256,6 +263,7 @@ dry_run = false
 diff_context = 3
 state_file = "~/.local/state/lazygerrit/state.json"   # drafts and reviewed marks
 color_scheme = "auto"        # dark/light background, for {{colorScheme}} in diff_renderers
+syntax_highlight = "auto"    # review view: delta --color-only if delta is installed; "off"; or a command
 
 [[diff_renderers]]           # optional diff tools, see "Diff tools" above
 command = "delta --paging=never"
