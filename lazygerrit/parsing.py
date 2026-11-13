@@ -346,6 +346,8 @@ _JOB_RE = re.compile(
 _BUILDSET_RE = re.compile(r"https?://\S+/buildset/\S+")
 _SKIPPED_RE = re.compile(r"^Skipped (\d+) jobs?", re.IGNORECASE)
 _START_RE = re.compile(r"Starting (?P<pipeline>[\w-]+) jobs:\s*(?P<url>\S+)")
+_MERGE_FAILED_RE = re.compile(r"^Merge Failed\.", re.M)
+_MERGE_ERROR_RE = re.compile(r"Error merging \S+ for (\d+,\d+)")
 _PIPELINES = ("run-selected", "slow-check", "slowcheck", "gate", "check", "post", "periodic")
 
 
@@ -419,6 +421,22 @@ def ci_messages(change: Change) -> tuple[list[CIReport], list[CIStart]]:
         if rep:
             reports.append(rep)
     return reports, starts
+
+
+def zuul_merge_failure(change: Change) -> Optional[tuple[ChangeMessage, str]]:
+    """Zuul's "Merge Failed." report, if that is the CI's latest word on the current patch set.
+
+    Returns (the message, the "change,patchset" Zuul could not merge, which can be a parent change).
+    Any later CI message on the patch set means Zuul got past merging, e.g. after a recheck.
+    """
+    for m in reversed(change.messages):
+        if m.patch_set != change.ps or not m.author.is_bot():
+            continue
+        if not _MERGE_FAILED_RE.search(m.message):
+            return None
+        failed = _MERGE_ERROR_RE.search(m.message)
+        return m, failed.group(1) if failed else f"{change.number},{change.ps}"
+    return None
 
 
 def latest_report(change: Change, patch_set: Optional[int] = None) -> Optional[CIReport]:

@@ -12,6 +12,7 @@ from lazygerrit.parsing import (
     parse_zuul_report,
     threads_from_change,
     threads_from_rest,
+    zuul_merge_failure,
 )
 
 ZUUL = {"name": "svc00140", "email": "svc00140@example.com", "username": "svc00140"}
@@ -146,6 +147,22 @@ class ZuulParsingTest(unittest.TestCase):
             {"timestamp": 410, "reviewer": ZUUL, "message": "Patch Set 2:\n\nStarting check jobs: https://zuul/x"},
         ]
         self.assertEqual(ci_state(parse_change(change_json(comments=msgs)))[0], "running")
+
+    def test_merge_failure_is_zuuls_latest_word_on_the_current_patch_set(self):
+        failed = (
+            "Patch Set 2:\n\nMerge Failed.\n\nThis change or one of its cross-repo dependencies was unable to be "
+            "automatically merged with the current state of its repository.\nWarning:\n  Error merging src for 703347,4"
+        )
+        msgs = change_json()["comments"] + [
+            {"timestamp": 400, "reviewer": ME, "message": "Patch Set 2:\n\nrecheck"},
+            {"timestamp": 410, "reviewer": ZUUL, "message": failed},
+        ]
+        msg, change = zuul_merge_failure(parse_change(change_json(comments=msgs)))
+        self.assertEqual((msg.timestamp, change), (410, "703347,4"))
+        later = msgs + [{"timestamp": 500, "reviewer": ZUUL, "message": "Patch Set 2:\n\nStarting check jobs: https://zuul/x"}]
+        self.assertIsNone(zuul_merge_failure(parse_change(change_json(comments=later))))
+        old_ps = [dict(m, message=m["message"].replace("Patch Set 2", "Patch Set 1")) for m in msgs]
+        self.assertIsNone(zuul_merge_failure(parse_change(change_json(comments=old_ps))))
 
     def test_live_status(self):
         items = [

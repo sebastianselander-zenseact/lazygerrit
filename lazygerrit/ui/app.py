@@ -15,7 +15,7 @@ import traceback
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from .. import __version__
 from .. import operations as ops
@@ -24,8 +24,8 @@ from ..config import Config
 from ..diff import LineRef, parse_unified
 from ..drafts import Draft, StateStore
 from ..gerrit import CommandError, CommandEvent, RestError
-from ..models import COMMIT_MSG, Account, Change, CIJob, FileInfo, LocalCommit, Thread
-from ..parsing import ci_messages, ci_state, filter_threads, latest_report, threads_from_change
+from ..models import COMMIT_MSG, Account, Change, CIJob, FileInfo, LocalCommit, MergeInfo, Thread
+from ..parsing import ci_messages, ci_state, filter_threads, latest_report, threads_from_change, zuul_merge_failure
 from ..renderers import BUILTIN, DiffRenderer, detect_color_scheme, syntax_command
 from ..srcrepo import CI_COMMANDS, discover_run_selected_jobs, known_hashtags, prio_high_hashtags
 from ..zuul import ZuulError
@@ -190,6 +190,14 @@ class App(ReviewMixin):
         self.rendered_out: OrderedDict[tuple, Any] = OrderedDict()
         self.pending_map: Optional[tuple[Any, tuple[str, float]]] = None
         self.color_scheme = detect_color_scheme(cfg.color_scheme)
+        # Merge conflicts: patch sets in the local clone are merged (in a scratch area) into the branch
+        # tip on Gerrit, which is looked up at most every merge_check_interval seconds.
+        self.merge_checks = bool(cfg.merge_check_interval)
+        self.branch_tip: Optional[str] = None
+        self.branch_tip_at = 0.0
+        self.merge_checked: dict[tuple[str, str], list[str]] = {}  # (tip, revision) -> conflicting files
+        self.merge_latest: dict[str, list[str]] = {}  # revision -> conflicting files at the newest tip checked
+        self.merge_pending: set[str] = set()
         self.syntax_command = syntax_command(cfg.syntax_highlight)
         self.diff_styles: dict[tuple, dict[int, Any]] = {}
         self.syntax_warned = False
@@ -208,6 +216,7 @@ class App(ReviewMixin):
             show_owner=self.show_owner_for_tab(),
             hide_wip=self.cfg.tabs[self.p_changes.tab].name == "WIP",
             drafts=self.draft_counts.get(c.number, 0),
+            conflict=self.has_conflict(c),
         )
         ch.key_fn = lambda c: c.number
         ch.filter_fn = (
@@ -215,7 +224,7 @@ class App(ReviewMixin):
         )
         ch.empty_text = "Loading…"
         st = self.p_stack
-        st.row_fn = render.stack_row
+        st.row_fn = lambda c, w: render.stack_row(c, w, conflict=self.has_conflict(c.change))
         st.key_fn = lambda c: c.change_id or c.sha
         st.filter_fn = lambda c: f"{c.short} {c.subject} {c.change.number if c.change else ''}"
         st.empty_text = "Loading…"
@@ -514,6 +523,7 @@ class App(ReviewMixin):
             self._drop_if_outdated(c)
         first_load = idx not in self.tab_loaded
         self.tab_data[idx] = changes
+        self.check_merges(changes)
         self.tab_loaded[idx] = time.monotonic()
         self.tab_errors.pop(idx, None)
         self.connected = True
@@ -618,6 +628,7 @@ class App(ReviewMixin):
         p.title = f"Local stack ({base}..HEAD)" if base else "Local stack"
         p.empty_text = f"No local commits on top of {base}" if base else "Could not determine the base branch"
         p.set_items(commits)
+        self.check_merges(c.change for c in commits)
         if self.focus == "stack" or (self.focus == "main" and self.last_side == "stack"):
             self.on_selection()
 
@@ -687,6 +698,7 @@ class App(ReviewMixin):
             self.ensure_threads(n, force=True)
         if ch.open:
             self.ensure_zuul(n, ch.ps)
+        self.check_merges([ch])
         self.ensure_chain(n)
         if self.ctx == n:
             self.refresh_ctx_panels()
@@ -1104,6 +1116,7 @@ class App(ReviewMixin):
             live=live,
             zuul_status_url=zurl,
             loading=n not in self.details,
+            merge=self.merge_info(ch),
         )
         self.set_main(("change", n), f"Change {n}", lines)
 
@@ -1122,6 +1135,7 @@ class App(ReviewMixin):
                 threads=self.threads_cache.get(n),
                 live=self.zuul_cache.get((n, ch.ps), (0, None))[1],
                 loading=n not in self.details,
+                merge=self.merge_info(ch),
             )
         self.set_main(("commit", c.sha), f"Commit {c.short}", lines)
 
@@ -1313,6 +1327,73 @@ class App(ReviewMixin):
         return out
 
     # ------------------------------------------------------------------ input
+
+    # ------------------------------------------------------------------ merge conflicts
+
+    def check_merges(self, changes: Iterable[Optional[Change]]) -> None:
+        """Check in the background whether open changes whose current patch set is in the local clone
+        merge cleanly into their branch on Gerrit."""
+        if not self.merge_checks or not self.be.git.available:
+            return
+        for c in changes:
+            if c is not None and c.open and c.branch == self.cfg.branch and c.current and c.current.revision:
+                self.merge_pending.add(c.current.revision)
+        self._run_merge_checks()
+
+    def _run_merge_checks(self) -> None:
+        if "merge-check" in self.inflight or not self.merge_pending:
+            return
+        fresh = self.branch_tip is not None and time.monotonic() - self.branch_tip_at < self.cfg.merge_check_interval
+        tip = self.branch_tip if fresh else None
+        revs = sorted(r for r in self.merge_pending if tip is None or (tip, r) not in self.merge_checked)
+        self.merge_pending = set()
+        if not revs:
+            return
+        git, branch = self.be.git, self.cfg.branch
+
+        def work() -> tuple[str, dict[str, list[str]]]:
+            t = tip or git.remote_tip(branch)
+            if not t:
+                raise CommandError(f"git ls-remote {git.remote} refs/heads/{branch}", 2, "", f"{branch} was not found on Gerrit")
+            if not git.has_commit(t):
+                git.fetch_branch(branch)
+            return t, {rev: git.merge_conflicts(t, rev) for rev in sorted(git.present_commits(revs))}
+
+        def done(result: tuple[str, dict[str, list[str]]]) -> None:
+            t, found = result
+            if t != self.branch_tip:
+                self.merge_checked = {k: v for k, v in self.merge_checked.items() if k[0] == t}
+            self.branch_tip, self.branch_tip_at = t, time.monotonic()
+            for rev, files in found.items():
+                self.merge_checked[(t, rev)] = files
+                self.merge_latest[rev] = files
+            if found:
+                self.update_main(data_changed=True)
+            self._run_merge_checks()
+
+        def failed(e: BaseException) -> None:
+            if isinstance(e, CommandError) and e.returncode == 129:  # git < 2.38 has no merge-tree --write-tree
+                self.merge_checks = False
+
+        self.submit("merge-check", work, done, failed)
+
+    def merge_info(self, ch: Optional[Change]) -> Optional[MergeInfo]:
+        """Whether the change can be merged: from the local check, else from Zuul's last report."""
+        if ch is None or not ch.open or ch.current is None:
+            return None
+        files = self.merge_latest.get(ch.current.revision) if ch.branch == self.cfg.branch else None
+        detailed = self.details.get(ch.number)
+        msgs = detailed if detailed is not None and detailed.ps == ch.ps else ch
+        zuul = zuul_merge_failure(msgs) if msgs.messages else None
+        if files:
+            return MergeInfo(True, ch.branch, files, zuul)
+        if zuul:
+            return MergeInfo(files is None, ch.branch, [], zuul)
+        return None
+
+    def has_conflict(self, ch: Optional[Change]) -> bool:
+        info = self.merge_info(ch)
+        return info is not None and info.conflict
 
     def reload_drafts(self) -> None:
         """Pick up drafts written by another lazygerrit instance."""
@@ -1829,6 +1910,7 @@ class App(ReviewMixin):
 
     def act_refresh(self) -> None:
         self.reload_drafts()
+        self.branch_tip_at = 0.0  # look up the branch on Gerrit again for merge checks
         # Retry diff tools that failed (successful renders of a patch set never change).
         self.rendered_out = OrderedDict((k, v) for k, v in self.rendered_out.items() if isinstance(v, tuple) and not v[0])
         self.load_status()

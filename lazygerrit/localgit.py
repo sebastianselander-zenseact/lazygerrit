@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 import shlex
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .gerrit import CommandError, Runner
+from .gerrit import CommandError, Runner, runtime_dir
 from .models import FileInfo, LocalCommit
 
 _FIELD = "\x1f"
@@ -42,6 +44,8 @@ class LocalGit:
         self.branch = branch
         self.git_ssh_command = git_ssh_command
         self._env: Optional[dict] = None
+        self._scratch: Optional[str] = None
+        self._objects: Optional[str] = None
 
     @property
     def available(self) -> bool:
@@ -177,6 +181,68 @@ class LocalGit:
     def ensure_commit(self, sha: str, ref: str) -> None:
         if not self.has_commit(sha):
             self.fetch(ref)
+
+    # -- merge conflicts (Gerrit's "mergeable") ------------------------------------------------
+
+    def remote_tip(self, branch: str) -> Optional[str]:
+        """The commit ``branch`` points to on Gerrit right now (git ls-remote, changes nothing locally)."""
+        out = self.git("ls-remote", self.remote, f"refs/heads/{branch}", title="Branch tip", timeout=60)
+        for line in out.splitlines():
+            sha, _, ref = line.partition("\t")
+            if ref.strip() == f"refs/heads/{branch}":
+                return sha.strip()
+        return None
+
+    def fetch_branch(self, branch: str) -> None:
+        """Fetch the objects of a branch on Gerrit without moving origin/<branch> or any other ref."""
+        self.git(
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "fetch",
+            "--refmap=",
+            "--no-write-fetch-head",
+            "--no-tags",
+            "--quiet",
+            self.remote,
+            f"refs/heads/{branch}",
+            title="Fetch branch",
+            timeout=300,
+        )
+
+    def present_commits(self, shas: Sequence[str]) -> set[str]:
+        """The commits of ``shas`` that are in the local clone."""
+        wanted = [s for s in shas if s]
+        if not wanted or not self.available:
+            return set()
+        out = self.git("cat-file", "--batch-check", input="".join(f"{s}^{{commit}}\n" for s in wanted).encode(), timeout=60)
+        return {s for s, line in zip(wanted, out.splitlines(), strict=False) if not line.endswith(" missing")}
+
+    def merge_conflicts(self, base: str, rev: str) -> list[str]:
+        """The files that conflict when ``rev`` is merged into ``base``; empty if it merges cleanly.
+
+        Uses git merge-tree (git 2.38+). The merge result is written to a scratch object directory,
+        so the repository is not touched.
+        """
+        if self._objects is None:
+            common = Path(self.git("rev-parse", "--git-common-dir").strip())
+            self._objects = str((self.repo / common if not common.is_absolute() else common).resolve() / "objects")
+        if self._scratch is None:
+            self._scratch = tempfile.mkdtemp(prefix=f"lazygerrit-merge-{os.getpid()}-", dir=runtime_dir())
+            atexit.register(shutil.rmtree, self._scratch, True)
+        env = dict(self.env(), GIT_OBJECT_DIRECTORY=self._scratch, GIT_ALTERNATE_OBJECT_DIRECTORIES=self._objects)
+        cmd = ["git", "-C", str(self.repo), "merge-tree", "--write-tree", "--name-only", "--no-messages", base, rev]
+        res = self.runner.run(cmd, env=env, title="Merge check", timeout=120, check=False)
+        if res.returncode not in (0, 1):
+            raise CommandError("git " + shlex.join(cmd[3:]), res.returncode, res.stdout, res.stderr)
+        files = res.stdout.splitlines()[1:] if res.returncode == 1 else []
+        return list(dict.fromkeys(f for f in files if f))
+
+    def close(self) -> None:
+        if self._scratch:
+            shutil.rmtree(self._scratch, ignore_errors=True)
+            self._scratch = None
 
     def diff(self, base: str, rev: str, paths: Sequence[str], context: int = 3) -> str:
         return self.git(

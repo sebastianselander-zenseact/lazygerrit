@@ -141,6 +141,15 @@ HEAD:refs/for/master`, a selected commit, `%wip`, `%ready`, `%topic=`, `%hashtag
 **CI**: `f` cycles the job filter, `o` opens the build page, `r` → `J` run-selected for exactly that job.
 **Messages**: `f` hides/shows CI bot messages.
 
+**Merge conflicts**: a red `CONFLICT` tag marks open changes that cannot be merged into their branch
+(Gerrit's "Merge Conflict"), and the change view lists the conflicting files. This Gerrit does not
+report mergeability over SSH, so lazygerrit checks it: patch sets that are in your clone are merged
+into the branch as it is on Gerrit right now, with `git merge-tree` writing to a scratch directory.
+Your working tree, refs and object store are left alone, apart from fetching the branch's new
+commits (without moving `origin/master`). For changes that are not in your clone, Zuul's latest
+"Merge Failed" report is used instead. The branch on Gerrit is looked up at most every
+`merge_check_interval` seconds (`R` looks again). This needs git 2.38 or newer.
+
 ### Code review
 
 Comments work like in the Gerrit web UI: everything you write is a **draft** until you publish.
@@ -264,6 +273,7 @@ diff_context = 3
 state_file = "~/.local/state/lazygerrit/state.json"   # drafts and reviewed marks
 color_scheme = "auto"        # dark/light background, for {{colorScheme}} in diff_renderers
 syntax_highlight = "auto"    # review view: delta --color-only if delta is installed; "off"; or a command
+merge_check_interval = 600   # seconds between looking up the branch on Gerrit for merge checks (0 = off)
 
 [[diff_renderers]]           # optional diff tools, see "Diff tools" above
 command = "delta --paging=never"
@@ -290,12 +300,13 @@ tab, the local stack and the selected change, every `refresh_interval` seconds. 
 cursor has rested for 120 ms before loading a change and caches change details for 45 s. While CI
 jobs are running it polls Zuul, not Gerrit, every `zuul_refresh_interval` seconds. After
 `idle_pause` seconds without a key press all background refreshing stops, and it resumes on the
-next key. The only expensive query (`--patch-sets` together with `--files`) is never used.
+next key. The only expensive query (`--patch-sets` together with `--files`) is never used. Merge
+checks add a `git ls-remote` every `merge_check_interval` seconds, plus a fetch when the branch moved.
 
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests -t .   # 110+ tests, no network needed
+python3 -m unittest discover -s tests -t .   # 120+ tests, no network needed
 ./bin/lazygerrit --demo                       # play with the UI offline
 ruff check lazygerrit tests
 ```

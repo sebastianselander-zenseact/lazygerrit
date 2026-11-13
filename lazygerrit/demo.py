@@ -174,6 +174,7 @@ class FakeGerritServer:
         self.live: dict[tuple[int, int], dict] = {}
         self.calls: list[list[str]] = []
         self.up_to_date: set[int] = set()
+        self.branch_tip: Optional[str] = None  # master on the server; it has moved on since the clone
 
     # -- data helpers -------------------------------------------------------------------------
 
@@ -820,6 +821,9 @@ class FakeRunner(Runner):
             return self.server.handle(gerrit_split(" ".join(args[idx + 1 :])), input)
         if args[:1] == ["git"] and "review" in args[:5]:
             return 0, "Switched to a new branch 'review/demo'\n", ""
+        if args[:1] == ["git"] and "ls-remote" in args:
+            tip = self.server.branch_tip
+            return 0, (f"{tip}\trefs/heads/master\n" if tip and "refs/heads/master" in args else ""), ""
         if args[:1] == ["git"] and "fetch" in args:
             return 0, "", ""
         if args[:1] == ["git"] and "push" in args[:5]:
@@ -955,12 +959,29 @@ def build_demo_world(root: Path) -> tuple[Path, FakeGerritServer]:
     other4 = dict(_FILES_BASE)
     other4["doc/rapid.md"] += "\nObsolete.\n"
     abandoned = _commit(repo, other4, cm("Old approach to cropping", 100090), now - 90000)
+    # master on the server got a commit after the clone, which conflicts with Kim's change.
+    _run(repo, "checkout", "-q", "--detach", base)
+    upstream_files = dict(_FILES_BASE)
+    upstream_files["tests/test_spax.py"] = (
+        "from stringent.rapid.spax import run\n\n\ndef test_empty(tmp_path):\n    f = tmp_path / 'x'\n    f.write_text('')\n    assert run(f) == ['']\n"
+    )
+    upstream = _commit(repo, upstream_files, "Add spax tests", now - 3600, SAM)
     _run(repo, "checkout", "-q", "-B", "review/100103", head)
-    for rev, name in [(c1_ps1, "c1ps1"), (c3_gerrit, "c3"), (kim, "kim"), (robin, "robin"), (wip, "wip"), (abandoned, "ab")]:
+    refs = [
+        (c1_ps1, "c1ps1"),
+        (c3_gerrit, "c3"),
+        (kim, "kim"),
+        (robin, "robin"),
+        (wip, "wip"),
+        (abandoned, "ab"),
+        (upstream, "upstream"),
+    ]
+    for rev, name in refs:
         _run(repo, "update-ref", f"refs/demo/{name}", rev)
 
     s = FakeGerritServer(repo)
     s.self_user = ME["username"]
+    s.branch_tip = upstream
     ch = s.add_change(100050, "Bump rapiddev22", ME, [merged], status="MERGED", hours_ago=40)
     s.vote(ch, 1, SAM, "Code-Review", 2, 41)
     s.vote(ch, 1, ZUUL_BOT, "Verified", 2, 40)
@@ -1033,6 +1054,12 @@ def build_demo_world(root: Path) -> tuple[Path, FakeGerritServer]:
     s.vote(ch, 1, ZUUL_BOT, "Verified", 1, 7)
     s.vote(ch, 1, SAM, "Code-Review", 2, 6)
     s.message(ch, ZUUL_BOT, _report(1, True, now), 7)
+    merge_failed = (
+        "Patch Set 1:\n\nMerge Failed.\n\nThis change or one of its cross-repo dependencies was unable to be "
+        "automatically merged with the current state of its repository. Please rebase the change and upload a new "
+        "patchset.\nWarning:\n  Error merging demo for 100201,1"
+    )
+    s.message(ch, ZUUL_BOT, merge_failed, 6.5)
     return repo, s
 
 

@@ -634,6 +634,45 @@ class BrokenHighlighterTest(AppTestCase):
         self.assertIn("changed the diff's lines", self.app.toast[0])
 
 
+class MergeConflictTest(AppTestCase):
+    """The demo's master on the server has a commit that conflicts with Kim's change 100200."""
+
+    def row(self, number):
+        p = self.app.p_changes
+        return plain(p.row_fn(next(c for c in p.view() if c.number == number), 120))
+
+    def test_conflicting_changes_get_a_badge_and_the_files(self):
+        self.press("]")  # Incoming
+        self.assertIn("CONFLICT Fix flaky HIL smoke test", self.row(100200))
+        self.assertNotIn("CONFLICT", self.row(100201))
+        self.select_change(100200)
+        text = self.screen()
+        self.assertIn("Merge      conflicts with master in 1 file", text)
+        self.assertIn("tests/test_spax.py", text)
+        self.select_change(100201)
+        self.assertIn("merges cleanly into master now", self.screen())
+        self.assertIn("Zuul could not merge patch set 1", self.screen())
+        self.press("[")  # Outgoing: my changes do not conflict
+        self.assertFalse(any("CONFLICT" in self.row(c.number) for c in self.app.p_changes.view()))
+        self.assertFalse(any("CONFLICT" in plain(self.app.p_stack.row_fn(c, 120)) for c in self.app.p_stack.view()))
+
+    def test_refresh_looks_at_the_branch_again(self):
+        self.press("]")
+        self.assertIn("CONFLICT", self.row(100200))
+        self.server.branch_tip = self.app.be.git.git("rev-parse", "origin/master").strip()
+        self.press("R")
+        self.assertNotIn("CONFLICT", self.row(100200))
+
+    def test_without_local_checks_zuuls_report_is_used(self):
+        self.app.merge_checks = False
+        self.app.merge_latest.clear()
+        self.press("]")
+        self.select_change(100201)
+        self.assertIn("CONFLICT Refactor zuul dispatcher docs", self.row(100201))
+        self.assertIn("Zuul could not merge patch set 1", self.screen())
+        self.assertIn("rebase it and upload a new patch set", self.screen())
+
+
 class DryRunAppTest(AppTestCase):
     dry_run = True
 

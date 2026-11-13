@@ -70,6 +70,7 @@ class Config:
     diff_renderers: list[Any] = field(default_factory=list)  # renderers.DiffRenderer
     color_scheme: str = "auto"
     syntax_highlight: Any = "auto"  # "auto" (delta if installed), "off" or a command like delta --color-only
+    merge_check_interval: int = 600  # seconds between looking up the branch on Gerrit for merge checks (0 = off)
     problems: list[str] = field(default_factory=list)
 
     @property

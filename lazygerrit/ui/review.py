@@ -289,6 +289,7 @@ class ReviewMixin:
             rows, styles, problem = result
             self.diff_rows[key] = rows
             self.diff_styles[key] = styles
+            self.check_merges([ch])  # the patch set may only now be in the local clone
             if problem and not self.syntax_warned:
                 self.syntax_warned = True
                 self.show_toast(problem, error=True, seconds=10)

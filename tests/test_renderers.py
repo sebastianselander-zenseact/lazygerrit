@@ -192,6 +192,27 @@ class RenderTest(unittest.TestCase):
         self.assertIn("no-such-diff-tool-xyz", out)
 
 
+class MergeCheckTest(unittest.TestCase):
+    """The demo's master on the server has a commit that conflicts with Kim's change 100200."""
+
+    def test_conflicts_are_found_without_writing_to_the_repository(self):
+        be, cfg, server, tmp = create_demo(latency=0)
+        try:
+            git = be.git
+            tip = git.remote_tip("master")
+            self.assertEqual(tip, server.branch_tip)
+            kim, mine = (git.git("rev-parse", f"refs/demo/{n}").strip() for n in ("kim", "c3"))
+            self.assertEqual(git.present_commits([kim, mine, "0" * 40]), {kim, mine})
+            objects = Path(cfg.repo, ".git", "objects")
+            before = sorted(p for p in objects.rglob("*") if p.is_file())
+            self.assertEqual(git.merge_conflicts(tip, kim), ["tests/test_spax.py"])
+            self.assertEqual(git.merge_conflicts(tip, mine), [])
+            self.assertEqual(sorted(p for p in objects.rglob("*") if p.is_file()), before)
+        finally:
+            be.close()
+            cleanup_demo(tmp)
+
+
 @unittest.skipUnless(shutil.which("delta"), "delta is not installed")
 class DeltaHighlightTest(unittest.TestCase):
     def test_delta_colors_every_code_line_of_a_real_diff(self):

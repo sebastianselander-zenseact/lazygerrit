@@ -153,3 +153,5 @@ class Backend:
 
     def close(self) -> None:
         self.ssh.close()
+        if self.git is not None:
+            self.git.close()

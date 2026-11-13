@@ -20,6 +20,7 @@ from ..models import (
     CIReport,
     FileInfo,
     LocalCommit,
+    MergeInfo,
     Thread,
 )
 from ..parsing import ci_state, format_duration_ms, is_ci_comment
@@ -121,7 +122,52 @@ def status_tag(ch: Change) -> Optional[tuple[str, Style]]:
     return None
 
 
-def change_row(ch: Change, width: int, *, show_owner: bool, hide_wip: bool = False, drafts: int = 0) -> Line:
+CONFLICT_TAG = ("CONFLICT ", theme.BAD)
+
+
+def merge_lines(ch: Change, merge: MergeInfo, width: int) -> list[Line]:
+    """The "Merge" rows of the change details: conflicts with the branch, or Zuul's merge failure."""
+    zuul_text: Line = []
+    if merge.zuul:
+        msg, failed = merge.zuul
+        where = "" if failed == f"{ch.number},{ch.ps}" else f" (in {failed})"
+        zuul_text = [
+            (
+                f"Zuul could not merge patch set {ch.ps}{where} {rel_ago(msg.timestamp)}",
+                theme.BAD if merge.conflict else theme.DIM,
+            )
+        ]
+    if not merge.conflict:
+        return [
+            kv(
+                "Merge",
+                [(f"merges cleanly into {merge.branch} now", theme.OK), ("  ·  ", theme.DIM)]
+                + zuul_text
+                + [("; recheck to retry", theme.DIM)],
+            )
+        ]
+    if not merge.files:
+        return [kv("Merge", zuul_text + [("  ·  rebase it and upload a new patch set", theme.DIM)])]
+    n = len(merge.files)
+    out = [
+        kv(
+            "Merge",
+            [
+                (f"conflicts with {merge.branch} in {n} file{'s' if n != 1 else ''}", theme.BAD),
+                ("  ·  Gerrit cannot rebase it: rebase locally, resolve and push", theme.DIM),
+            ],
+        )
+    ]
+    for path in merge.files[:8]:
+        out.append([(" " * 11, PLAIN), (truncate_str(sanitize(path), max(10, width - 11)), theme.BAD)])
+    if n > 8:
+        out.append([(" " * 11, PLAIN), (f"… and {n - 8} more", theme.DIM)])
+    return out
+
+
+def change_row(
+    ch: Change, width: int, *, show_owner: bool, hide_wip: bool = False, drafts: int = 0, conflict: bool = False
+) -> Line:
     parts: Line = [(str(ch.number), theme.NUMBER), (" ", PLAIN)]
     parts.append(verified_span(ch.label_value("Verified")))
     parts.append((" ", PLAIN))
@@ -139,6 +185,8 @@ def change_row(ch: Change, width: int, *, show_owner: bool, hide_wip: bool = Fal
     tag = status_tag(ch)
     if tag and not (hide_wip and ch.wip and not ch.is_merged and not ch.is_abandoned):
         parts.append(tag)
+    if conflict:
+        parts.append(CONFLICT_TAG)
     parts.append((sanitize(ch.subject), Style(dim=True) if ch.is_abandoned else PLAIN))
     return parts
 
@@ -162,7 +210,7 @@ SYNC_TEXT = {
 }
 
 
-def stack_row(c: LocalCommit, width: int) -> Line:
+def stack_row(c: LocalCommit, width: int, conflict: bool = False) -> Line:
     state = c.sync_state
     glyph, gstyle, hstyle = SYNC_GLYPHS[state]
     parts: Line = [(c.short, hstyle), (" ", PLAIN), (glyph, gstyle), (" ", PLAIN)]
@@ -173,6 +221,8 @@ def stack_row(c: LocalCommit, width: int) -> Line:
         parts.append((" ", PLAIN))
         parts.append(vote_span(c.change.label_value("Code-Review")))
         parts.append((" ", PLAIN))
+    if conflict:
+        parts.append(CONFLICT_TAG)
     parts.append((sanitize(c.subject), PLAIN))
     return parts
 
@@ -536,6 +586,7 @@ def change_details(
     live: Optional[list[CIJob]] = None,
     zuul_status_url: str = "",
     loading: bool = False,
+    merge: Optional[MergeInfo] = None,
 ) -> list[Line]:
     out: list[Line] = []
     head: Line = [(str(ch.number), theme.NUMBER), (" ", PLAIN), (sanitize(ch.subject), theme.BOLD)]
@@ -549,6 +600,8 @@ def change_details(
     if ch.submit_status() and ch.open:
         status_parts.append((f" · {ch.submit_status().replace('_', ' ').lower()}", theme.DIM))
     out.append(kv("Status", status_parts))
+    if merge is not None:
+        out += merge_lines(ch, merge, width)
     out.append(kv("Owner", account_line(ch.owner)))
     upd: Line = [(rel_ago(ch.last_updated), PLAIN)]
     if ch.created_on:
@@ -859,7 +912,9 @@ def status_dashboard(
             ("-1", theme.BAD),
             ("  Code-Review, Secondary-Review   ", PLAIN),
             ("●", theme.WARN),
-            ("  unresolved comments", PLAIN),
+            ("  unresolved comments   ", PLAIN),
+            CONFLICT_TAG,
+            (" cannot be merged (rebase)", PLAIN),
         ]
     )
     out.append(

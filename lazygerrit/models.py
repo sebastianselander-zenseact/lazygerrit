@@ -159,6 +159,21 @@ class Thread:
 
 
 @dataclass
+class MergeInfo:
+    """Whether a change's current patch set can be merged into its branch (Gerrit's "Merge Conflict").
+
+    ``conflict`` comes from a local check against the branch on Gerrit when the patch set is in the
+    local clone (then ``files`` lists the conflicts), otherwise from Zuul's last report
+    (``zuul`` is that "Merge Failed" message and the change,patchset it could not merge).
+    """
+
+    conflict: bool
+    branch: str
+    files: list[str] = field(default_factory=list)
+    zuul: Optional[tuple["ChangeMessage", str]] = None
+
+
+@dataclass
 class ChangeMessage:
     timestamp: int
     author: Account
