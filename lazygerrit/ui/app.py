@@ -20,7 +20,8 @@ from .. import __version__
 from .. import operations as ops
 from ..backend import Backend, NeedsRest
 from ..config import Config
-from ..diff import LineRef, file_as_added, parse_unified
+from ..diff import LineRef, parse_unified
+from ..drafts import Draft, StateStore
 from ..gerrit import CommandError, CommandEvent, RestError
 from ..models import COMMIT_MSG, Account, Change, CIJob, FileInfo, LocalCommit, Thread
 from ..parsing import ci_messages, ci_state, filter_threads, latest_report, threads_from_change
@@ -29,6 +30,7 @@ from ..zuul import ZuulError
 from . import render, theme
 from .layout import SIDE_PANELS, compute_layout
 from .render import CIHeader
+from .review import ReviewMixin
 from .screen import Canvas, CursesCanvas, CursesInput, Event, Key, Mouse, Paste, Resize, VirtualCanvas
 from .system import copy_to_clipboard, editor_command, open_url
 from .text import PLAIN, Line, Style, line_width, text_block, text_width, truncate
@@ -69,11 +71,12 @@ class Binding:
     show: bool = False
     alts: tuple[str, ...] = ()
     label: Optional[str] = None
-    bar: Optional[str] = None
+    bar: Any = None
+    bar_key: Optional[str] = None
 
 
-class App:
-    def __init__(self, backend: Backend, cfg: Config, *, demo: bool = False):
+class App(ReviewMixin):
+    def __init__(self, backend: Backend, cfg: Config, *, demo: bool = False, state: Optional[StateStore] = None):
         self.be = backend
         self.cfg = cfg
         self.demo = demo
@@ -146,6 +149,15 @@ class App:
         self.show_bot_messages = True
         self.ci_filter = 0
         self.diff_rows: dict[tuple, list] = {}
+        self.state = state if state is not None else StateStore(None)
+        self.draft_counts: dict[int, int] = self.state.draft_counts()
+        self.view_ps: dict[int, int] = {}
+        self.base_ps: dict[int, int] = {}
+        self.full_file = False
+        self.local_files: dict[tuple[int, int, int], list[FileInfo]] = {}
+        self.pending_cursor: Optional[tuple[Any, Callable[[list[Any]], Optional[int]]]] = None
+        self._reviewed_now: set[str] = set()
+        self.rendered_diff: Any = None
         self.context_cache: dict[tuple, list[tuple[int, str]]] = {}
         self.diff_context = cfg.diff_context
         self.main_key: Any = None
@@ -172,7 +184,11 @@ class App:
     def _setup_panels(self) -> None:
         ch = self.p_changes
         ch.row_fn = lambda c, w: render.change_row(
-            c, w, show_owner=self.show_owner_for_tab(), hide_wip=self.cfg.tabs[self.p_changes.tab].name == "WIP"
+            c,
+            w,
+            show_owner=self.show_owner_for_tab(),
+            hide_wip=self.cfg.tabs[self.p_changes.tab].name == "WIP",
+            drafts=self.draft_counts.get(c.number, 0),
         )
         ch.key_fn = lambda c: c.number
         ch.filter_fn = (
@@ -195,14 +211,14 @@ class App:
         cp.filter_fn = lambda it: (
             f"{it.location} {' '.join(c.message for c in it.comments)} {' '.join(c.author.display for c in it.comments)}"
             if isinstance(it, Thread)
-            else f"{it.author.display} {it.message}"
+            else (f"draft {it.location} {it.message}" if isinstance(it, Draft) else f"{it.author.display} {it.message}")
         )
         cp.empty_text = "Select a change"
 
     def _files_row(self, it: Any, w: int) -> Line:
         if isinstance(it, FileInfo):
-            counts = self.file_comment_counts().get(it.path, (0, 0))
-            return render.file_row(it, w, counts[0], counts[1])
+            counts = self.file_comment_counts().get(it.path, (0, 0, 0))
+            return render.file_row(it, w, counts[0], counts[1], counts[2], it.path in self._reviewed_now)
         return render.ci_row(it, w)
 
     @staticmethod
@@ -216,12 +232,16 @@ class App:
     def _comments_row(self, it: Any, w: int) -> Line:
         if isinstance(it, Thread):
             return render.thread_row(it, w)
+        if isinstance(it, Draft):
+            return render.draft_row(it, w)
         return render.message_row(it, w, self.cfg.bot_usernames)
 
     @staticmethod
     def _comments_key(it: Any) -> Any:
         if isinstance(it, Thread):
             return ("t", it.path, it.line, it.patch_set, it.root.id or it.root.message[:40])
+        if isinstance(it, Draft):
+            return ("d", it.id)
         return ("m", it.timestamp, it.author.username, it.message[:40])
 
     # ------------------------------------------------------------------ lifecycle
@@ -291,6 +311,12 @@ class App:
         self.load_tab(self.p_changes.tab)
         self.load_stack()
         self.update_main()
+        if self.state.load_error:
+            self.show_toast(self.state.load_error, error=True, seconds=8)
+        elif self.draft_counts:
+            total = sum(self.draft_counts.values())
+            where = ", ".join(str(n) for n in sorted(self.draft_counts))
+            self.show_toast(f"You have {total} unpublished draft(s) on {where} — publish with p", seconds=8)
 
     def loop(self) -> None:
         assert self.input is not None
@@ -784,16 +810,24 @@ class App:
         q = self.tab_query(self.p_changes.tab)
         return not ("owner:self" in q and "-owner:self" not in q)
 
-    def file_comment_counts(self) -> dict[str, tuple[int, int]]:
+    def file_comment_counts(self) -> dict[str, tuple[int, int, int]]:
+        """path -> (threads, unresolved threads, drafts) on the patch set being viewed."""
         ch = self.ctx_change()
-        if ch is None or ch.number not in self.threads_cache:
+        if ch is None:
             return {}
-        counts: dict[str, tuple[int, int]] = {}
-        for t in self.threads_cache[ch.number][0]:
-            if t.patch_set != ch.ps or t.is_ci:
+        view = self.viewed_ps(ch)
+        psn = view.number if view else ch.ps
+        counts: dict[str, tuple[int, int, int]] = {}
+        for t in self.threads_cache.get(ch.number, ([], False))[0]:
+            if t.patch_set != psn or t.is_ci:
                 continue
-            n, u = counts.get(t.path, (0, 0))
-            counts[t.path] = (n + 1, u + (1 if t.unresolved else 0))
+            n, u, d = counts.get(t.path, (0, 0, 0))
+            counts[t.path] = (n + 1, u + (1 if t.unresolved else 0), d)
+        for dr in self.state.drafts_for(ch.number):
+            if dr.patch_set != psn:
+                continue
+            n, u, d = counts.get(dr.path, (0, 0, 0))
+            counts[dr.path] = (n, u, d + 1)
         return counts
 
     def current_files(self, ch: Change) -> Optional[list[FileInfo]]:
@@ -845,9 +879,9 @@ class App:
     def refresh_ctx_panels(self) -> None:
         ch = self.ctx_change()
         fp, cp = self.p_files, self.p_comments
-        suffix = f" · {ch.number},{ch.ps}" if ch else ""
-        fp.suffix = suffix
-        cp.suffix = suffix
+        fp.suffix = f" · {self.view_label(ch)}" if ch else ""
+        cp.suffix = f" · {ch.number},{ch.ps}" if ch else ""
+        self._reviewed_now = set()
         if ch is None:
             msg = "Select a change"
             if self.change_source == "stack":
@@ -859,7 +893,9 @@ class App:
             cp.set_items([])
             return
         if fp.tab == 0:
-            files = self.current_files(ch)
+            files = self.files_for_view(ch)
+            view = self.viewed_ps(ch)
+            self._reviewed_now = self.state.reviewed_paths(ch.number, view.number) if view else set()
             fp.empty_text = "Loading files…" if files is None else "No files"
             fp.set_items(files or [])
         else:
@@ -872,9 +908,10 @@ class App:
                 fp.empty_text = "No CI results for this change"
             fp.set_items(items)
         if cp.tab == 0:
+            drafts: list[Any] = list(self.state.drafts_for(ch.number))
             if ch.number not in self.threads_cache:
                 cp.empty_text = "Loading comments…"
-                cp.set_items([])
+                cp.set_items(drafts)
             else:
                 threads = self.visible_threads(ch.number)
                 total = len(self.threads_cache[ch.number][0])
@@ -887,7 +924,7 @@ class App:
                         else "No comments"
                     )
                 )
-                cp.set_items(threads)
+                cp.set_items(drafts + threads)
         else:
             msgs = list(reversed(ch.messages)) if ch.detailed else []
             if not self.show_bot_messages:
@@ -938,6 +975,7 @@ class App:
         self.main_key = key
         if not same:
             self.p_main.search = ""
+            self.rendered_diff = None
 
     def update_main(self, data_changed: bool = False) -> None:
         if self.focus == "main" and not data_changed:
@@ -956,6 +994,10 @@ class App:
                     self.show_commit(cur)
             elif kind == "diff" and self.main_diff:
                 self._render_diff(key)
+            elif kind == "draft":
+                d = self.state.draft(key[1])
+                if d is not None:
+                    self.show_draft(d)
             return
         if f == "status":
             self.set_main(("status",), "Status", self.status_lines())
@@ -985,6 +1027,8 @@ class App:
                 self.set_main(("empty", "comments"), "Comments", text_block(self.p_comments.empty_text, theme.DIM))
             elif isinstance(item, Thread):
                 self.show_thread(item)
+            elif isinstance(item, Draft):
+                self.show_draft(item)
             else:
                 self.set_main(("message", self._comments_key(item)), "Message", render.message_view(item, self.main_width))
 
@@ -1012,6 +1056,7 @@ class App:
             demo=self.demo,
             counts=counts,
             base_url=self.cfg.base_url,
+            drafts=sorted(self.draft_counts.items()),
         )
 
     def show_change(self, n: int) -> None:
@@ -1051,59 +1096,6 @@ class App:
             )
         self.set_main(("commit", c.sha), f"Commit {c.short}", lines)
 
-    def show_diff(self, f: FileInfo) -> None:
-        ch = self.ctx_change()
-        if ch is None or ch.current is None:
-            return
-        ps = ch.current
-        key = ("diff", ch.number, ps.number, f.path, self.diff_context)
-        self.main_diff = (ch.number, ps.number, f.path)
-        title = f"Diff · {f.display_path} · ps{ps.number}"
-        if key in self.diff_rows:
-            self._render_diff(key)
-            return
-        git = self.be.git
-        if f.path == COMMIT_MSG and ch.commit_message and not (git.available and git.has_commit(ps.revision)):
-            self.diff_rows[key] = file_as_added(render.synth_commit_msg(ch, ps, self.change_subjects()))
-            self._render_diff(key)
-            return
-        if not git.available:
-            self.set_main(
-                key,
-                title,
-                [[("Diffs need a local clone of the repository (start lazygerrit inside it or pass --repo).", theme.DIM)]],
-            )
-            return
-        if key != self.main_key:
-            note = "Loading diff… (fetching the patch set from Gerrit first if it is not in your clone yet)"
-            self.set_main(key, title, [[(note, theme.DIM)]], wrap=False)
-        ctx_lines = self.diff_context
-
-        def work() -> list:
-            git.ensure_commit(ps.revision, ps.ref)
-            if f.path == COMMIT_MSG:
-                return file_as_added(git.commit_message_file(ps.revision))
-            if f.path.startswith("/"):
-                return []
-            base = ps.parents[0] if ps.parents else f"{ps.revision}^"
-            paths = [f.path] + ([f.old_path] if f.old_path and f.old_path != f.path else [])
-            return parse_unified(git.diff(base, ps.revision, paths, ctx_lines))
-
-        def done(rows: list) -> None:
-            self.diff_rows[key] = rows
-            if self.main_key == key:
-                self._render_diff(key)
-
-        def failed(e: BaseException) -> None:
-            if self.main_key == key:
-                self.set_main(
-                    key,
-                    title,
-                    [[("Could not load the diff:", theme.BAD)]] + [[(ln, theme.BAD)] for ln in self.error_text(e).splitlines()],
-                )
-
-        self.submit(f"diff:{key}", work, done, failed, label="Loading diff")
-
     def change_subjects(self) -> dict[str, str]:
         """Revision -> subject for every patch set we know about (for /COMMIT_MSG parent lines)."""
         out: dict[str, str] = {}
@@ -1113,27 +1105,16 @@ class App:
                     out[ps.revision] = c.subject
         return out
 
-    def _render_diff(self, key: tuple) -> None:
-        rows = self.diff_rows.get(key)
-        if rows is None:
-            return
-        _, n, psn, path, _ctx = key
-        ch = self.change(n)
-        threads = [t for t in self.threads_cache.get(n, ([], False))[0] if t.path == path and t.patch_set == psn and not t.is_ci]
-        lines, meta = render.diff_lines(path, rows, threads, self.main_width)
-        name = "Commit message" if path == COMMIT_MSG else path
-        first = self.main_key != key
-        self.set_main(
-            key,
-            f"Diff · {name} · ps{psn}" + ("" if ch is None or ch.ps == psn else " (old)"),
-            lines,
-            wrap=False,
-            meta=meta,
-            cursor_mode=True,
-        )
-        if first:
-            first_line = next((i for i, m in enumerate(meta) if isinstance(m, LineRef)), 0)
-            self.p_main.cursor = first_line
+    def show_draft(self, d: Draft) -> None:
+        thread = None
+        if d.is_reply:
+            for t in self.threads_cache.get(d.change, ([], False))[0]:
+                if (d.in_reply_to and any(c.id == d.in_reply_to for c in t.comments)) or (
+                    not d.in_reply_to and (t.path, t.line, t.patch_set) == (d.path, d.line, d.patch_set)
+                ):
+                    thread = t
+                    break
+        self.set_main(("draft", d.id), f"Draft · {d.short_location}", render.draft_view(d, self.main_width, thread))
 
     def show_thread(self, t: Thread) -> None:
         ch = self.ctx_change()
@@ -1297,7 +1278,8 @@ class App:
             for b in self.bindings:
                 if b.ctx == ctx and b.show and b.key not in seen:
                     seen.add(b.key)
-                    out.append((b.bar or b.desc, b.label or b.key))
+                    bar = b.bar() if callable(b.bar) else b.bar
+                    out.append((bar or b.desc, b.bar_key or b.label or b.key))
         out.append(("Keybindings", "?"))
         return out
 
@@ -1332,7 +1314,8 @@ class App:
     def active_contexts(self) -> list[str]:
         f = self.focus
         if f == "main":
-            mode = "diff" if self.p_main.cursor_mode else ("thread" if self.main_key and self.main_key[0] == "thread" else "text")
+            kind = self.main_key[0] if self.main_key else ""
+            mode = "diff" if self.p_main.cursor_mode else (kind if kind in ("thread", "draft") else "text")
             return [f"main:{mode}", "main", "global"]
         if f == "cmdlog":
             return ["main", "global"]
@@ -1464,9 +1447,10 @@ class App:
             show: Any = False,
             alts: tuple[str, ...] = (),
             label: Optional[str] = None,
+            bar_key: Optional[str] = None,
         ) -> None:
-            bar = show if isinstance(show, str) else None
-            B.append(Binding(key, desc, fn, ctx, bool(show), alts, label, bar))
+            bar = show if isinstance(show, str) or callable(show) else None
+            B.append(Binding(key, desc, fn, ctx, bool(show), alts, label, bar, bar_key))
 
         # global
         bind("global", "q", "Quit", self.quit, alts=("<c-c>",))
@@ -1519,10 +1503,17 @@ class App:
         bind("stack", "P", "Push for review…", self.act_push_menu, show="Push")
 
         # change actions shared by changes/stack/files/comments
+        bind("change", "p", "Review: publish drafts with a vote and message", lambda: self.act_publish(), show=self.publish_bar)
         bind("change", "r", "CI: recheck, run-selected, prio_high…", self.act_ci_menu, show="Recheck/CI")
         bind("change", "a", "Vote (Code-Review, Secondary-Review)…", self.act_vote_menu, show="Vote")
-        bind("change", "c", "Comment", lambda: self.act_comment(), show="Comment")
-        bind("change", "C", "Comment using $EDITOR", lambda: self.act_comment(editor=True))
+        bind(
+            "change",
+            "c",
+            "Reply / comment (review dialog; selected changes: comment on all)",
+            lambda: self.act_comment(),
+            show="Comment",
+        )
+        bind("change", "C", "Reply / comment using $EDITOR", lambda: self.act_comment(editor=True))
         bind("change", "b", "Rebase…", self.act_rebase_menu, show="Rebase")
         bind("change", "t", "Set topic", lambda: self.act_topic(False))
         bind("change", "T", "Set topic on tower", lambda: self.act_topic(True))
@@ -1536,19 +1527,23 @@ class App:
         bind("change", "x", "All actions for this change…", self.act_change_menu, show="Actions")
 
         # files
-        bind("files:Files", "<enter>", "View diff (comment on lines with c)", self.act_focus_main, show="View diff")
+        bind("files:Files", "<enter>", "Review the diff (comment with c)", self.act_focus_main, show="Review diff")
+        bind("files:Files", "<space>", "Toggle file reviewed", self.act_toggle_reviewed, show="Reviewed")
+        bind("files:Files", "P", "View another patch set…", self.act_choose_patchset, show="Patch set")
+        bind("files:Files", "B", "Compare against base / older patch set…", self.act_choose_base, show="Base")
+        bind("files:Files", "z", "Toggle whole-file diffs", self.act_full_file)
         bind("files:Files", "e", "Edit file", self.act_edit_file)
-        bind("files:Files", "}", "More diff context", lambda: self.change_context(2))
-        bind("files:Files", "{", "Less diff context", lambda: self.change_context(-2))
         bind("files:CI", "<enter>", "Show job details", self.act_focus_main)
         bind("files:CI", "f", "Cycle job filter (all/failed/incl. skipped)", self.act_ci_filter, show="Filter jobs")
 
         # comments
-        bind("comments:Comments", "<enter>", "View thread", self.act_focus_main)
-        bind("comments:Comments", "r", "Reply", lambda: self.act_reply(), show="Reply")
-        bind("comments:Comments", "d", "Reply 'Done' and resolve", lambda: self.act_reply("Done", True), show="Done")
-        bind("comments:Comments", "A", "Reply 'Ack' and resolve", lambda: self.act_reply("Ack", True))
-        bind("comments:Comments", "u", "Reply and toggle resolved", self.act_reply_toggle)
+        bind("comments:Comments", "<enter>", "Show in code (or view thread)", self.act_comment_enter, show="Show in code")
+        bind("comments:Comments", "r", "Reply (draft)", lambda: self.act_reply(), show="Reply")
+        bind("comments:Comments", "d", "Reply 'Done' and resolve (draft)", lambda: self.act_reply("Done", True), show="Done")
+        bind("comments:Comments", "A", "Reply 'Ack' and resolve (draft)", lambda: self.act_reply("Ack", True))
+        bind("comments:Comments", "u", "Toggle resolved (reply / draft)", self.act_reply_toggle)
+        bind("comments:Comments", "c", "Edit draft / reply to the change", self.act_comments_c)
+        bind("comments:Comments", "D", "Delete draft", self.act_delete_draft)
         bind("comments:Comments", "f", "Cycle filter (unresolved/all/incl. CI)", self.act_comment_filter, show="Show resolved")
         bind("comments:Comments", "e", "Open file at comment in $EDITOR", self.act_edit_thread_file)
         bind("comments:Messages", "<enter>", "View message", self.act_focus_main)
@@ -1566,15 +1561,41 @@ class App:
         bind("main", "N", "Previous match", lambda: self.next_match(False))
         bind("main", "h", "Back to side panel", lambda: self.focus_panel(self.last_side), alts=("<left>",))
         bind("main", "o", "Open in browser", self.act_open, show="Open")
-        bind("main:diff", "c", "Comment on line", self.act_comment_line, show="Comment line")
-        bind("main:diff", "r", "Reply to comment thread", lambda: self.act_reply(), show="Reply")
+        bind("main", "p", "Review: publish drafts with a vote and message", lambda: self.act_publish(), show=self.publish_bar)
+        bind("main:diff", "c", "Comment on line / range (draft); edit draft under cursor", self.act_comment_line, show="Comment")
+        bind("main:diff", "v", "Select a range of lines", self.act_diff_range)
+        bind("main:diff", "r", "Reply to the thread under the cursor (draft)", lambda: self.act_reply(), show="Reply")
+        bind(
+            "main:diff", "p", "Review: publish drafts with a vote and message", lambda: self.act_publish(), show=self.publish_bar
+        )
+        bind("main:diff", "d", "Reply 'Done' and resolve (draft)", lambda: self.act_reply("Done", True))
+        bind("main:diff", "A", "Reply 'Ack' and resolve (draft)", lambda: self.act_reply("Ack", True))
+        bind("main:diff", "u", "Toggle resolved (reply / draft)", self.act_reply_toggle)
+        bind("main:diff", "D", "Delete the draft under the cursor", self.act_delete_draft)
+        bind("main:diff", "]", "Next hunk", lambda: self.diff_jump_hunk(1), show="Hunk", bar_key="]/[")
+        bind("main:diff", "[", "Previous hunk", lambda: self.diff_jump_hunk(-1))
+        bind("main:diff", "}", "Next comment", lambda: self.diff_jump_comment(1), show="Thread", bar_key="}/{")
+        bind("main:diff", "{", "Previous comment", lambda: self.diff_jump_comment(-1))
+        bind("main:diff", ".", "Next file", lambda: self.diff_next_file(1), show="File", bar_key="./,")
+        bind("main:diff", ",", "Previous file", lambda: self.diff_next_file(-1))
+        bind(
+            "main:diff",
+            "<space>",
+            "Toggle reviewed (and go to the next file)",
+            lambda: self.act_toggle_reviewed(advance=True),
+            show="Reviewed",
+        )
+        bind("main:diff", "z", "Toggle whole-file diff", self.act_full_file)
+        bind("main:diff", "P", "View another patch set…", self.act_choose_patchset)
+        bind("main:diff", "B", "Compare against base / older patch set…", self.act_choose_base)
         bind("main:diff", "e", "Edit file at line", self.act_edit_file)
-        bind("main:diff", "}", "More diff context", lambda: self.change_context(2))
-        bind("main:diff", "{", "Less diff context", lambda: self.change_context(-2))
-        bind("main:thread", "r", "Reply", lambda: self.act_reply(), show="Reply")
-        bind("main:thread", "d", "Reply 'Done' and resolve", lambda: self.act_reply("Done", True), show="Done")
-        bind("main:thread", "A", "Reply 'Ack' and resolve", lambda: self.act_reply("Ack", True))
-        bind("main:thread", "u", "Reply and toggle resolved", self.act_reply_toggle)
+        bind("main:thread", "r", "Reply (draft)", lambda: self.act_reply(), show="Reply")
+        bind("main:thread", "d", "Reply 'Done' and resolve (draft)", lambda: self.act_reply("Done", True), show="Done")
+        bind("main:thread", "A", "Reply 'Ack' and resolve (draft)", lambda: self.act_reply("Ack", True))
+        bind("main:thread", "u", "Toggle resolved (reply)", self.act_reply_toggle)
+        bind("main:draft", "c", "Edit draft", self.act_comments_c, show="Edit")
+        bind("main:draft", "u", "Toggle resolved", self.act_reply_toggle)
+        bind("main:draft", "D", "Delete draft", self.act_delete_draft)
 
     # ------------------------------------------------------------------ navigation
 
@@ -1683,6 +1704,9 @@ class App:
             self.p_main.hscroll = max(0, self.p_main.hscroll + d)
 
     def act_escape(self) -> None:
+        if self.focus == "main" and self.p_main.anchor is not None:
+            self.p_main.anchor = None
+            return
         if self.focus in ("main", "cmdlog"):
             self.focus_panel(self.last_side)
             return
@@ -1747,13 +1771,6 @@ class App:
                 self.set_main(key, f"Commit {c.short} (local)", lines, wrap=False)
 
         self.submit(f"localdiff:{c.sha}", lambda: self.be.git.show_patch(c.sha), done, lambda e: self.error(self.error_text(e)))
-
-    def change_context(self, d: int) -> None:
-        self.diff_context = max(0, min(50, self.diff_context + d))
-        self.show_toast(f"Diff context: {self.diff_context} lines")
-        item = self.p_files.current()
-        if isinstance(item, FileInfo):
-            self.show_diff(item)
 
     # ------------------------------------------------------------------ actions: generic
 
@@ -1903,7 +1920,7 @@ class App:
         done_popup: bool = False,
         after: Optional[Callable[[Any], None]] = None,
         reload_stack: bool = False,
-        on_fail: Optional[Callable[[], None]] = None,
+        on_fail: Optional[Callable[[BaseException], None]] = None,
     ) -> None:
         def on_done(result: Any) -> None:
             if isinstance(result, list):
@@ -1924,7 +1941,7 @@ class App:
 
         def on_error(e: BaseException) -> None:
             if on_fail is not None:
-                on_fail()
+                on_fail(e)
             self.error(self.error_text(e), f"{title} failed")
             self.after_write(refresh, reload_stack)
 
@@ -1960,6 +1977,12 @@ class App:
         items = [
             MenuItem(
                 "CI…", self.act_ci_menu, key="r", description="recheck, slowcheck, regate, priocheck, run-selected, prio_high"
+            ),
+            MenuItem(
+                "Review / publish drafts…",
+                lambda: self.act_publish(),
+                key="p",
+                description=f"{self.draft_counts.get(ch.number, 0)} draft(s), votes and a message in one go",
             ),
             MenuItem("Vote…", self.act_vote_menu, key="a", description="Code-Review, Secondary-Review"),
             MenuItem("Comment", lambda: self.act_comment(), key="c", description="patchset-level comment"),
@@ -2187,6 +2210,9 @@ class App:
             item("Secondary-Review", 0, "S", "No score"),
             item("Secondary-Review", -1, "x", "Secondary review rejected"),
             MenuItem("Other label…", self.act_custom_label, key="l", section="Other", description="e.g. Verified=0"),
+            MenuItem(
+                "Review dialog…", lambda: self.act_publish(), key="p", section="Other", description="vote + message + your drafts"
+            ),
         ]
         self.menu(f"Vote on {self.names(ts)}", items)
 
@@ -2218,41 +2244,6 @@ class App:
             self.do_vote(ts, label, v)
 
         self.prompt("Vote (LABEL=VALUE)", submit, hint="e.g. Code-Review=+1, Secondary-Review=0")
-
-    def act_comment(self, editor: bool = False, unresolved: bool = False) -> None:
-        ts = self.need_targets()
-        if not ts:
-            return
-        names = self.names(ts)
-
-        header = [f"Comment on {c.number},{c.ps}: {c.subject}" for c in ts]
-
-        def open_prompt(initial: str = "") -> None:
-            self.prompt(
-                f"Comment on {names}" + (" (unresolved)" if unresolved else ""),
-                post,
-                initial=initial,
-                multiline=True,
-                on_editor=lambda cur: self.edit_text(header, cur, post),
-                hint="Posted as a patchset-level comment. Markdown is supported.",
-            )
-
-        def post(text: str) -> None:
-            text = text.strip("\n")
-            if not text.strip():
-                self.show_toast("Empty comment, nothing posted", error=True)
-                return
-            self.run_op(
-                f"Comment on {names}",
-                lambda: [ops.patchset_comment(self.be, t, text, unresolved) for t in ops.resolve(self.be, ts)],
-                refresh=[c.number for c in ts],
-                on_fail=lambda: open_prompt(text),
-            )
-
-        if editor:
-            self.edit_text(header, "", post)
-        else:
-            open_prompt()
 
     def edit_text(self, header: Sequence[str], initial: str, on_done: Callable[[str], None]) -> None:
         fd, path = tempfile.mkstemp(prefix="lazygerrit-", suffix=".md")
@@ -2643,11 +2634,16 @@ class App:
         if f == "files":
             item = self.p_files.current()
             if isinstance(item, FileInfo) and ch is not None:
-                url = f"{self.cfg.change_url(ch.number, ch.project)}/{ch.ps}/{item.path.lstrip('/') if not item.is_magic else item.path}"
+                view = self.viewed_ps(ch)
+                base = self.base_patchset(ch)
+                psid = f"{base.number}..{view.number if view else ch.ps}" if base else str(view.number if view else ch.ps)
+                path = item.path if item.is_magic else item.path.lstrip("/")
+                url = f"{self.cfg.change_url(ch.number, ch.project)}/{psid}/{path}"
                 if self.focus == "main":
                     meta = self.p_main.cursor_meta()
                     if isinstance(meta, LineRef) and meta.line:
-                        url += f"#{'b' if meta.side == 'PARENT' else ''}{meta.line}"
+                        left = meta.side == "PARENT" or (base is not None and meta.patch_set == base.number)
+                        url += f"#{'b' if left else ''}{meta.line}"
                 self.open(url)
                 return
             if isinstance(item, CIJob):
@@ -2766,7 +2762,7 @@ class App:
         if self.focus == "main" and self.main_diff:
             path = self.main_diff[2]
             meta = self.p_main.cursor_meta()
-            if isinstance(meta, LineRef) and meta.side is None:
+            if isinstance(meta, LineRef) and meta.side is None and meta.patch_set == self.main_diff[1]:
                 line = meta.line
         if not path or path.startswith("/"):
             self.show_toast("Select a file", error=True)
@@ -2806,59 +2802,6 @@ class App:
         item = self.p_comments.current() if self.focus == "comments" and self.p_comments.tab == 0 else None
         return item if isinstance(item, Thread) else None
 
-    def act_reply(self, preset: Optional[str] = None, resolve: Optional[bool] = None) -> None:
-        t = self.current_thread()
-        ch = self.ctx_change()
-        if t is None or ch is None:
-            self.show_toast(
-                "Select a comment thread" + (" (move the cursor onto a comment)" if self.focus == "main" else ""), error=True
-            )
-            return
-        n = ch.number
-        exact = self.threads_cache.get(n, ([], False))[1]
-
-        hint = "" if exact else "Without REST access the reply is posted at the same line (not threaded)."
-        state = {True: " (resolves)", False: " (unresolves)", None: ""}[resolve]
-
-        def open_prompt(initial: str = "") -> None:
-            self.prompt(
-                f"Reply to {t.location}{state}",
-                post,
-                initial=initial,
-                multiline=True,
-                hint=hint,
-                on_editor=lambda cur: self.edit_text(
-                    [f"Reply to {t.location} on {n},{t.patch_set}", *("> " + ln for ln in t.last.message.splitlines()[:10])],
-                    cur,
-                    post,
-                ),
-            )
-
-        def post(text: str) -> None:
-            if not text.strip():
-                return
-            self.run_op(
-                f"Reply on {t.short_location}",
-                lambda: ops.reply(self.be, n, t, text.strip("\n"), resolve),
-                refresh=[n],
-                on_fail=lambda: open_prompt(text),
-            )
-
-        if preset:
-            post(preset)
-        else:
-            open_prompt()
-
-    def act_reply_toggle(self) -> None:
-        t = self.current_thread()
-        if t is None:
-            self.show_toast("Select a comment thread", error=True)
-            return
-        if t.unresolved is None:
-            self.error("The resolution state is unknown without REST access (add an HTTP password to ~/.netrc).")
-            return
-        self.act_reply(resolve=bool(t.unresolved))
-
     def act_comment_filter(self) -> None:
         if not self.show_resolved:
             self.show_resolved, self.show_ci_comments = True, False
@@ -2885,40 +2828,3 @@ class App:
             self.show_toast("Select a file comment", error=True)
             return
         self._edit_path(t.path, t.line or None)
-
-    def act_comment_line(self) -> None:
-        meta = self.p_main.cursor_meta()
-        if isinstance(meta, tuple) and meta and meta[0] == "thread":
-            self.act_reply()
-            return
-        if not isinstance(meta, LineRef) or not meta.path or not self.main_diff:
-            self.show_toast("Move the cursor to a line of the diff to comment on it", error=True)
-            return
-        n, psn, _ = self.main_diff
-        ch = self.change(n)
-        if ch is None:
-            return
-        target = ops.Target(n, psn, ch.project, ch.subject)
-        where = f"{meta.path}:{meta.line}" + (" (base)" if meta.side == "PARENT" else "")
-
-        def open_prompt(initial: str = "") -> None:
-            self.prompt(
-                f"Comment on {where} ({n},{psn})",
-                post,
-                initial=initial,
-                multiline=True,
-                hint="New inline comments are unresolved, like in the Gerrit web UI.",
-                on_editor=lambda cur: self.edit_text([f"Comment on {where} in {n},{psn}"], cur, post),
-            )
-
-        def post(text: str) -> None:
-            if not text.strip():
-                return
-            self.run_op(
-                f"Comment on {where}",
-                lambda: ops.inline_comment(self.be, target, meta.path, meta.line, text.strip("\n"), meta.side, unresolved=True),
-                refresh=[n],
-                on_fail=lambda: open_prompt(text),
-            )
-
-        open_prompt()

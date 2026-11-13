@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Optional, Sequence
 
 from .backend import Backend
+from .drafts import Draft
 from .gerrit import CommandError
 from .models import PATCHSET_LEVEL, Change, Thread
 from .srcrepo import run_selected_comment
@@ -234,6 +235,89 @@ def abandon(be: Backend, t: Target, message: Optional[str] = None) -> str:
 def restore(be: Backend, t: Target) -> str:
     be.ssh.review(t.number, t.patch_set, restore=True, title=f"Restore {t.number}")
     return f"Restored {t.number}"
+
+
+class PartialPublish(Exception):
+    """Some drafts were published before a later `gerrit review` call failed."""
+
+    def __init__(self, published: list[str], error: BaseException):
+        self.published = published
+        self.error = error
+        super().__init__(str(error))
+
+
+def _drafts_by_path(drafts: Sequence[Draft]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for d in drafts:
+        grouped.setdefault(d.path, []).append(d.comment_input())
+    return grouped
+
+
+def publish_review(
+    be: Backend,
+    change: Change,
+    drafts: Sequence[Draft],
+    labels: Optional[dict[str, int]] = None,
+    message: Optional[str] = None,
+    shown_ps: Optional[int] = None,
+    published: Optional[list[str]] = None,
+) -> str:
+    """Publish draft comments, votes and a message like Gerrit's reply dialog.
+
+    Comments are attached to the patch set they were written on, so drafts on older patch sets
+    are sent with one `gerrit review` per patch set; votes and the message go to the current
+    patch set together with its drafts (a single notification in the common case). Votes are
+    refused when the change got a patch set newer than ``shown_ps``. Ids of published drafts are
+    appended to ``published`` as soon as each call succeeds.
+    """
+    done: list[str] = published if published is not None else []
+    current = be.light(change.number) or change
+    if labels and shown_ps and current.ps != shown_ps:
+        raise StaleChange(
+            f"{change.number} has a new patch set ({current.ps}) since it was loaded here ({shown_ps}).\n"
+            "Your drafts are kept. Press R to refresh, look at the new patch set, then publish again."
+        )
+    by_ps: dict[int, list[Draft]] = {}
+    for d in drafts:
+        by_ps.setdefault(d.patch_set, []).append(d)
+    n = change.number
+    try:
+        for ps in sorted(by_ps):
+            if ps == current.ps:
+                continue
+            group = by_ps[ps]
+            be.ssh.review(
+                n,
+                ps,
+                json_input={"comments": comment_map(_drafts_by_path(group))},
+                title=f"Publish {len(group)} draft(s) on {n},{ps}",
+            )
+            done.extend(d.id for d in group)
+        body: dict = {}
+        mine = by_ps.get(current.ps, [])
+        comments = _drafts_by_path(mine)
+        if message:
+            # Like Gerrit's reply dialog: the message becomes a (resolved) patchset-level comment.
+            comments.setdefault(PATCHSET_LEVEL, []).insert(0, {"message": message, "unresolved": False})
+        if comments:
+            body["comments"] = comment_map(comments)
+        if labels:
+            body["labels"] = dict(labels)
+        if body:
+            be.ssh.review(n, current.ps, json_input=body, title=f"Publish review on {n},{current.ps}")
+            done.extend(d.id for d in mine)
+    except Exception as e:
+        if done:
+            raise PartialPublish(list(done), e) from e
+        raise
+    parts = []
+    if drafts:
+        parts.append(f"{len(drafts)} comment{'s' if len(drafts) != 1 else ''}")
+    for label, value in (labels or {}).items():
+        parts.append(f"{label}{value:+d}" if value else f"{label} 0")
+    if message:
+        parts.append("message")
+    return f"Published {', '.join(parts) or 'review'} on {n}"
 
 
 def apply_bottom_up(targets: Sequence[Target], fn: Callable[[Target], str], progress: Progress = _noop) -> list[str]:

@@ -33,14 +33,20 @@ class DiffTest(unittest.TestCase):
         base = Comment("q.sql", 2, Account("Kim"), "old side", 1)
         threads = [Thread("q.sql", 2, 1, [c], True), Thread("q.sql", 2, 1, [base], False, side="PARENT")]
         lines, meta = render.diff_lines("q.sql", rows, threads, 80)
-        refs = [m for m in meta if isinstance(m, LineRef)]
-        self.assertIn(LineRef("q.sql", 2, "PARENT"), refs)
-        self.assertIn(LineRef("q.sql", 2, None), refs)
+        refs = [(m.path, m.line, m.side) for m in meta if isinstance(m, LineRef)]
+        self.assertIn(("q.sql", 2, "PARENT"), refs)
+        self.assertIn(("q.sql", 2, None), refs)
         text = ["".join(t for t, _ in ln) for ln in lines]
         del_idx = next(i for i, ln in enumerate(text) if "-- old comment" in ln)
         add_idx = next(i for i, ln in enumerate(text) if "-- new comment" in ln)
         self.assertIn("old side", text[del_idx + 2])
         self.assertIn("why?", text[add_idx + 2])
+
+    def test_intraline_highlights_only_the_changed_words(self):
+        rows = parse_unified("@@ -1,1 +1,1 @@\n-    out = crop(path, 0, 100)\n+    out = crop(path, 0, 128)\n")
+        lines, _ = render.diff_lines("a.py", rows, [], 80)
+        emphasized = [[t for t, st in ln if st.bg != -1] for ln in lines if any(st.bg != -1 for _, st in ln)]
+        self.assertEqual(emphasized, [["100"], ["128"]])
 
     def test_commit_message_as_added_file(self):
         rows = file_as_added("Parent: x\n\nSubject\n")

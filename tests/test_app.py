@@ -6,7 +6,7 @@ from lazygerrit.demo import GerritFailure, cleanup_demo, create_demo
 from lazygerrit.diff import LineRef
 from lazygerrit.ui.app import App
 from lazygerrit.ui.screen import Key, Paste, VirtualCanvas
-from lazygerrit.ui.widgets import ConfirmPopup, MenuPopup, MessagePopup, PromptPopup
+from lazygerrit.ui.widgets import ConfirmPopup, MenuPopup, MessagePopup, PromptPopup, ReviewPopup
 
 
 class AppTestCase(unittest.TestCase):
@@ -135,17 +135,22 @@ class ActionsTest(AppTestCase):
         self.press("c")
         self.type("why log here")
         self.press("<enter>")
+        self.assertEqual(self.writes(), [])
+        self.assertIn("✎ draft", self.screen())
+        self.press("p", "<enter>")
+        self.assertEqual(len(self.writes()), 1)
         c = self.server.changes[100101]["_comments"][-1]
         self.assertEqual(
             (c["path"], c["line"], c["message"], c["unresolved"]), ("stringent/rapid/crop.py", 7, "why log here", True)
         )
+        self.assertEqual(self.app.state.drafts_for(100101), [])
 
     def test_reply_done_in_comments_panel(self):
         self.select_change(100101)
         self.press("5")
         t = self.app.p_comments.current()
         self.assertTrue(t.unresolved)
-        self.press("d")
+        self.press("d", "p", "<enter>")
         c = self.server.changes[100101]["_comments"][-1]
         self.assertEqual((c["message"], c["in_reply_to"], c["unresolved"]), ("Done", t.last.id, False))
 
@@ -218,8 +223,8 @@ class ReviewRegressionTest(AppTestCase):
             self.type("important feedback")
             self.press("<enter>")
         self.assertIsInstance(self.app.popups[-1], MessagePopup)
-        self.assertIsInstance(self.app.popups[-2], PromptPopup)
-        self.assertEqual(self.app.popups[-2].text, "important feedback")
+        self.assertIsInstance(self.app.popups[-2], ReviewPopup)
+        self.assertEqual(self.app.popups[-2].message, "important feedback")
 
     def test_connection_errors_are_split_into_lines(self):
         app = App(self.be, self.cfg, demo=True)
@@ -234,8 +239,124 @@ class ReviewRegressionTest(AppTestCase):
         self.assertFalse(any("\n" in t for t in spans))
 
 
+class CodeReviewTest(AppTestCase):
+    def open_diff(self, number, file_index=1):
+        self.select_change(number)
+        self.press("4", *(["j"] * file_index), "<enter>")
+        self.assertEqual(self.app.focus, "main")
+
+    def cursor_to(self, line, side=None):
+        meta = self.app.p_main.meta
+        target = next(i for i, m in enumerate(meta) if isinstance(m, LineRef) and m.line == line and m.side == side)
+        delta = target - self.app.p_main.cursor
+        self.press(*(["j"] * delta if delta > 0 else ["k"] * -delta))
+
+    def test_range_comment(self):
+        self.open_diff(100101)
+        self.cursor_to(7)
+        self.press("v", "j", "j", "c")
+        self.type("extract a helper")
+        self.press("<enter>")
+        (d,) = self.app.state.drafts_for(100101)
+        self.assertEqual((d.line, d.range["start_line"], d.range["end_line"]), (9, 7, 9))
+        self.assertEqual(d.range["end_character"], len("        data = fh.read()"))
+        self.press("p", "<enter>")
+        c = self.server.changes[100101]["_comments"][-1]
+        self.assertEqual((c["line"], c["range"]["start_line"]), (9, 7))
+
+    def test_review_dialog_publishes_drafts_vote_and_message_at_once(self):
+        self.open_diff(100101)
+        self.cursor_to(8)
+        self.press("c")
+        self.type("nit")
+        self.press("<enter>", "p")
+        dialog = self.app.popups[-1]
+        self.assertIsInstance(dialog, ReviewPopup)
+        self.assertIn("1 draft comment will be published", self.screen())
+        self.press("<right>", "<tab>", "<tab>")
+        self.type("lgtm")
+        self.press("<enter>")
+        (review,) = [c for c in self.writes() if c[0] == "review"]
+        self.assertEqual(review[1:], ["100101,2", "--json"])
+        comments = self.server.changes[100101]["_comments"]
+        self.assertEqual(sorted(c["message"] for c in comments[-2:]), ["lgtm", "nit"])
+        votes = [
+            (a["type"], a["value"])
+            for a in self.server.changes[100101]["_patchsets"][1]["approvals"]
+            if a["by"]["username"] == "s0000001"
+        ]
+        self.assertEqual(votes, [("Code-Review", "1")])
+        self.assertEqual(self.app.state.drafts_for(100101), [])
+
+    def test_typing_in_the_review_dialog_never_changes_votes(self):
+        self.select_change(100101)
+        self.press("p")
+        self.type("lgtm -")
+        self.assertEqual(self.app.popups[-1].values, {"Code-Review": 0, "Secondary-Review": 0})
+        self.assertEqual(self.app.popups[-1].message, "lgtm -")
+
+    def test_comment_on_an_older_patch_set(self):
+        self.select_change(100101)
+        self.press("4", "P", "1")
+        self.assertIn("100101,1 (old)", self.screen())
+        self.press("j", "<enter>")
+        self.assertIn("Use a context manager here.", self.screen())
+        self.cursor_to(8)
+        self.press("c")
+        self.type("same here")
+        self.press("<enter>", "p", "<enter>")
+        c = self.server.changes[100101]["_comments"][-1]
+        self.assertEqual((c["message"], c["patch_set"], c["line"]), ("same here", 1, 8))
+
+    def test_compare_against_an_older_patch_set(self):
+        self.select_change(100101)
+        self.press("4", "B", "1", "j", "<enter>")
+        text = self.screen()
+        self.assertIn("ps1→ps2", text)
+        self.assertIn("+def crop_dlt(path):", text)
+        self.assertNotIn('+    LOG.info("Cropping %s", path)', text)
+        self.cursor_to(10, None)
+        meta = self.app.p_main.cursor_meta()
+        self.assertEqual((meta.patch_set, meta.side), (2, None))
+
+    def test_enter_on_a_comment_jumps_to_the_code(self):
+        self.select_change(100101)
+        self.press("5")
+        old = next(i for i, t in enumerate(self.app.p_comments.view()) if t.patch_set == 1)
+        self.press(*(["j"] * old), "<enter>")
+        self.assertEqual(self.app.focus, "main")
+        kind, thread = self.app.p_main.cursor_meta()
+        self.assertEqual((kind, thread.patch_set, thread.line), ("thread", 1, 7))
+
+    def test_hunk_and_file_navigation(self):
+        self.open_diff(100101, file_index=0)
+        self.press(".")
+        self.assertIn("crop.py", self.app.main_key[4])
+        self.press("]")
+        meta = self.app.p_main.cursor_meta()
+        self.assertIsInstance(meta, LineRef)
+        self.press(",")
+        self.assertEqual(self.app.main_key[4], "/COMMIT_MSG")
+
+    def test_reviewed_marks(self):
+        self.open_diff(100101)
+        self.press("<space>")
+        self.assertTrue(self.app.state.is_reviewed(100101, 2, "stringent/rapid/crop.py"))
+        self.press("<esc>")
+        row = next(ln for ln in self.screen().splitlines() if "crop.py" in ln and "+7 -1" in ln)
+        self.assertIn("✓M", row)
+
+
 class DryRunAppTest(AppTestCase):
     dry_run = True
+
+    def test_dry_run_publish_keeps_drafts(self):
+        self.select_change(100101)
+        self.press("4", "j", "<enter>", "c")
+        self.type("kept")
+        self.press("<enter>", "p", "<enter>")
+        self.assertEqual(self.writes(), [])
+        self.assertEqual([d.message for d in self.app.state.drafts_for(100101)], ["kept"])
 
     def test_dry_run_logs_instead_of_sending(self):
         self.select_change(100102)

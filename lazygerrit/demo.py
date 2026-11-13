@@ -280,6 +280,7 @@ class FakeGerritServer:
         in_reply_to: Optional[str] = None,
         hours_ago: Optional[float] = None,
         side: Optional[str] = None,
+        range: Optional[dict] = None,
     ) -> str:
         self.comment_seq += 1
         cid = f"c{self.comment_seq:04d}"
@@ -300,6 +301,8 @@ class FakeGerritServer:
             c["in_reply_to"] = in_reply_to
         if side:
             c["side"] = side
+        if range:
+            c["range"] = range
         ch["_comments"].append(c)
         return cid
 
@@ -575,6 +578,7 @@ class FakeGerritServer:
                             unresolved,
                             item.get("in_reply_to"),
                             side=item.get("side"),
+                            range=item.get("range"),
                         )
                 if body.get("work_in_progress"):
                     ch["wip"] = True

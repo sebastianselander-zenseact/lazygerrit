@@ -120,6 +120,70 @@ class OperationsTest(unittest.TestCase):
         self.assertEqual([ln[:12] for ln in synth[:5]], [ln[:12] for ln in exact[:5]])
 
 
+class PublishReviewTest(unittest.TestCase):
+    def setUp(self):
+        self.be, self.cfg, self.server, self.tmp = create_demo(latency=0)
+
+    def tearDown(self):
+        cleanup_demo(self.tmp)
+
+    def reviews(self):
+        return [c for c in self.server.calls if c[0] == "review"]
+
+    def test_drafts_grouped_by_patch_set_with_vote_and_message_on_current(self):
+        from lazygerrit.drafts import Draft
+
+        ch = self.be.details(100101)
+        drafts = [
+            Draft(change=100101, patch_set=1, path="stringent/rapid/crop.py", line=7, message="old ps comment"),
+            Draft(change=100101, patch_set=2, path="stringent/rapid/crop.py", line=14, message="new ps comment"),
+        ]
+        published = []
+        text = ops.publish_review(self.be, ch, drafts, {"Code-Review": 1}, "LGTM otherwise", shown_ps=2, published=published)
+        self.assertEqual([r[1] for r in self.reviews()], ["100101,1", "100101,2"])
+        self.assertEqual(published, [drafts[0].id, drafts[1].id])
+        self.assertIn("Code-Review+1", text)
+        comments = self.server.changes[100101]["_comments"]
+        by_msg = {c["message"]: c for c in comments}
+        self.assertEqual(by_msg["old ps comment"]["patch_set"], 1)
+        self.assertEqual(by_msg["new ps comment"]["patch_set"], 2)
+        self.assertEqual((by_msg["LGTM otherwise"]["path"], by_msg["LGTM otherwise"]["unresolved"]), ("/PATCHSET_LEVEL", False))
+        votes = self.server.changes[100101]["_patchsets"][1]["approvals"]
+        self.assertIn(("Code-Review", "1", "s0000001"), [(a["type"], a["value"], a["by"]["username"]) for a in votes])
+
+    def test_partial_failure_reports_what_was_published(self):
+        from unittest import mock
+
+        from lazygerrit.demo import GerritFailure
+        from lazygerrit.drafts import Draft
+
+        ch = self.be.details(100101)
+        drafts = [
+            Draft(change=100101, patch_set=1, path="stringent/rapid/crop.py", line=7, message="a"),
+            Draft(change=100101, patch_set=2, path="stringent/rapid/crop.py", line=14, message="b"),
+        ]
+        real = self.server.review
+        calls = []
+
+        def flaky(args, stdin):
+            calls.append(args)
+            if len(calls) == 2:
+                raise GerritFailure("fatal: connection reset")
+            return real(args, stdin)
+
+        with mock.patch.object(self.server, "review", side_effect=flaky):
+            with self.assertRaises(ops.PartialPublish) as cm:
+                ops.publish_review(self.be, ch, drafts, shown_ps=2)
+        self.assertEqual(cm.exception.published, [drafts[0].id])
+
+    def test_votes_refused_on_a_newer_patch_set(self):
+        ch = self.be.details(100102)
+        ch_ps1 = ch.ps
+        ops.rebase(self.be, ops.Target.of(ch))
+        with self.assertRaises(ops.StaleChange):
+            ops.publish_review(self.be, ch, [], {"Code-Review": 2}, shown_ps=ch_ps1)
+
+
 class DryRunTest(unittest.TestCase):
     def test_nothing_is_sent(self):
         be, cfg, server, tmp = create_demo(latency=0, dry_run=True)

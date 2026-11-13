@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import calendar
+import difflib
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
 from .. import __version__
 from ..diff import DiffRow, LineRef
+from ..drafts import Draft
 from ..models import (
     Account,
     Change,
@@ -103,7 +106,7 @@ def status_tag(ch: Change) -> Optional[tuple[str, Style]]:
     return None
 
 
-def change_row(ch: Change, width: int, *, show_owner: bool, hide_wip: bool = False) -> Line:
+def change_row(ch: Change, width: int, *, show_owner: bool, hide_wip: bool = False, drafts: int = 0) -> Line:
     parts: Line = [(str(ch.number), theme.NUMBER), (" ", PLAIN)]
     parts.append(verified_span(ch.label_value("Verified")))
     parts.append((" ", PLAIN))
@@ -116,6 +119,8 @@ def change_row(ch: Change, width: int, *, show_owner: bool, hide_wip: bool = Fal
     if show_owner:
         parts.append((ch.owner.initials.ljust(2), theme.author_style(ch.owner.username or ch.owner.name)))
         parts.append((" ", PLAIN))
+    if drafts:
+        parts.append((f"✎{drafts} ", theme.MAGIC))
     tag = status_tag(ch)
     if tag and not (hide_wip and ch.wip and not ch.is_merged and not ch.is_abandoned):
         parts.append(tag)
@@ -167,32 +172,36 @@ FILE_STATUS_STYLE = {
 }
 
 
-def file_row(f: FileInfo, width: int, comments: int = 0, unresolved: int = 0) -> Line:
+def file_row(f: FileInfo, width: int, comments: int = 0, unresolved: int = 0, drafts: int = 0, reviewed: bool = False) -> Line:
     st = f.status_char
-    parts: Line = [(st, FILE_STATUS_STYLE.get(st, PLAIN)), (" ", PLAIN)]
+    parts: Line = [("✓" if reviewed else " ", theme.OK), (st, FILE_STATUS_STYLE.get(st, PLAIN)), (" ", PLAIN)]
     right: Line = []
+    if drafts:
+        right.append((f"✎{drafts} ", theme.MAGIC))
     if unresolved:
         right.append((f"●{unresolved} ", theme.WARN))
-    elif comments:
-        right.append((f"✎{comments} ", theme.DIM))
+    if comments - unresolved > 0:
+        right.append((f"○{comments - unresolved} ", theme.DIM))
     if not f.is_magic:
         right += [(f"+{f.insertions}", theme.OK), (" ", PLAIN), (f"-{f.deletions}", theme.BAD)]
     right_w = sum(text_width(t) for t, _ in right)
-    avail = max(4, width - 2 - right_w - 1)
+    avail = max(4, width - 3 - right_w - 1)
+    path_style = theme.DIM if reviewed else PLAIN
     if f.is_magic:
-        parts.append((truncate_str(f.display_path, avail), theme.MAGIC))
-        used = text_width(truncate_str(f.display_path, avail))
+        shown = truncate_str(f.display_path, avail)
+        parts.append((shown, theme.MAGIC))
+        used = text_width(shown)
     else:
         path = f.path
         if text_width(path) > avail:
             path = "…" + path[-(avail - 1) :]
         if "/" in path:
             d, base = path.rsplit("/", 1)
-            parts += [(d + "/", theme.DIM), (base, PLAIN)]
+            parts += [(d + "/", theme.DIM), (base, path_style)]
         else:
-            parts.append((path, PLAIN))
+            parts.append((path, path_style))
         used = text_width(path)
-    gap = max(1, width - 2 - used - right_w)
+    gap = max(1, width - 3 - used - right_w)
     parts.append((" " * gap, PLAIN))
     parts += right
     return parts
@@ -286,6 +295,53 @@ def thread_row(t: Thread, width: int) -> Line:
     parts.append((": ", theme.DIM))
     parts.append((first_line(t.root.message if len(t.comments) == 1 else last.message), PLAIN))
     return parts
+
+
+def draft_row(d: Draft, width: int) -> Line:
+    parts: Line = [("✎", theme.MAGIC), (" ", PLAIN), (f"ps{d.patch_set} ", theme.DIM), (d.short_location, theme.INFO)]
+    parts.append((" draft", theme.MAGIC))
+    if d.is_reply:
+        parts.append((" reply", theme.DIM))
+    parts += [(": ", theme.DIM), (first_line(d.message), PLAIN)]
+    return parts
+
+
+def draft_view(d: Draft, width: int, thread: Optional[Thread] = None) -> list[Line]:
+    state = "unresolved" if d.unresolved else "resolved"
+    out: list[Line] = [
+        [
+            ("✎ ", theme.MAGIC),
+            ("Draft", theme.MAGIC),
+            (" on ", PLAIN),
+            (d.location, theme.BOLD),
+            (f" · patch set {d.patch_set} · {state}", theme.DIM),
+        ],
+        [("Not published yet: press p to publish your drafts (with an optional vote and message).", theme.DIM)],
+        [],
+    ]
+    if thread is not None:
+        out.append([("In reply to", theme.HEADING)])
+        for c in thread.comments:
+            out += comment_block(c, width, indent="  ")
+        out.append([])
+    elif d.reply_to_text:
+        out.append([("In reply to: ", theme.DIM), (d.reply_to_text, PLAIN)])
+        out.append([])
+    out += wrap_lines(d.message, width, PLAIN, "  ")
+    out.append([])
+    out.append(
+        [
+            ("c", theme.KEY),
+            (" edit · ", theme.DIM),
+            ("u", theme.KEY),
+            (" toggle resolved · ", theme.DIM),
+            ("D", theme.KEY),
+            (" delete · ", theme.DIM),
+            ("enter", theme.KEY),
+            (" show in code", theme.DIM),
+        ]
+    )
+    return out
 
 
 def message_row(m: ChangeMessage, width: int, bots: Sequence[str] = ()) -> Line:
@@ -724,6 +780,7 @@ def status_dashboard(
     demo: bool,
     counts: list[tuple[str, Optional[int]]],
     base_url: str,
+    drafts: Sequence[tuple[int, int]] = (),
 ) -> list[Line]:
     out: list[Line] = [[(ln, theme.OK)] for ln in LOGO]
     out.append([(f"  lazygerrit {__version__} — a lazygit-style terminal UI for Gerrit", theme.DIM)])
@@ -767,6 +824,12 @@ def status_dashboard(
     out.append(heading("Dashboard"))
     for name, n in counts:
         out.append([("  ", PLAIN), (name.ljust(10), PLAIN), (str(n) if n is not None else "…", theme.BOLD if n else theme.DIM)])
+    if drafts:
+        out.append([])
+        out.append(heading("Unpublished drafts"))
+        for n, k in drafts:
+            out.append([("  ", PLAIN), (str(n), theme.NUMBER), (f"  ✎ {k} draft{'s' if k != 1 else ''}", theme.MAGIC)])
+        out.append([("  Select the change and press p to publish them.", theme.DIM)])
     out.append([])
     out.append(heading("Legend"))
     out.append(
@@ -807,7 +870,9 @@ def status_dashboard(
         ("enter", "drill down (files, diffs, threads)"),
         ("r", "CI: recheck, slowcheck, regate, run-selected, prio_high"),
         ("a", "vote (Code-Review, Secondary-Review)"),
-        ("c / C", "comment (inline prompt / $EDITOR)"),
+        ("c / C", "reply to a change (review dialog / $EDITOR)"),
+        ("p", "publish your drafts with a vote and message"),
+        ("4 enter", "review diffs: c comments a line, ]/[ hunks, ./, files"),
         ("x", "all actions for the selected change"),
         ("y / o", "copy (links, change number…) / open in browser"),
         ("v", "select a range of changes (actions apply to all)"),
@@ -836,40 +901,150 @@ def synth_commit_msg(ch: Change, ps: Any, subjects: Optional[dict[str, str]] = N
     return "\n".join(lines) + "\n" + ch.commit_message.rstrip("\n") + "\n"
 
 
+_TOKEN_RE = re.compile(r"\w+|\s+|[^\w\s]")
+ADD_EMPH = Style(fg=2, bg=22)
+DEL_EMPH = Style(fg=1, bg=52)
+
+
+def intraline(old: str, new: str) -> Optional[tuple[list[tuple[int, int]], list[tuple[int, int]]]]:
+    """Changed character ranges of a replaced line pair (word granularity); None if too different."""
+    if len(old) > 500 or len(new) > 500:
+        return None
+    a, b = _TOKEN_RE.findall(old), _TOKEN_RE.findall(new)
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    if sm.ratio() < 0.35:
+        return None
+
+    def offsets(tokens: list[str]) -> list[int]:
+        pos = [0]
+        for t in tokens:
+            pos.append(pos[-1] + len(t))
+        return pos
+
+    pa, pb = offsets(a), offsets(b)
+    ra: list[tuple[int, int]] = []
+    rb: list[tuple[int, int]] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        if i2 > i1:
+            ra.append((pa[i1], pa[i2]))
+        if j2 > j1:
+            rb.append((pb[j1], pb[j2]))
+    return ra, rb
+
+
+def emphasize(text: str, ranges: Sequence[tuple[int, int]], base: Style, emph: Style) -> Line:
+    out: Line = []
+    pos = 0
+    for start, end in ranges:
+        if start > pos:
+            out.append((text[pos:start], base))
+        if end > start:
+            out.append((text[start:end], emph))
+        pos = max(pos, end)
+    if pos < len(text):
+        out.append((text[pos:], base))
+    return out
+
+
+def _intraline_ranges(texts: list[str], rows: list[DiffRow]) -> dict[int, list[tuple[int, int]]]:
+    """Pair runs of deleted lines with the added lines that follow them and diff each pair."""
+    out: dict[int, list[tuple[int, int]]] = {}
+    i = 0
+    n = len(rows)
+    while i < n:
+        if rows[i].kind != "del":
+            i += 1
+            continue
+        d0 = i
+        while i < n and rows[i].kind == "del":
+            i += 1
+        a0 = i
+        while i < n and rows[i].kind == "add":
+            i += 1
+        dels, adds = list(range(d0, a0)), list(range(a0, i))
+        if not adds or len(dels) > 60 or len(adds) > 60:
+            continue
+        for di, ai in zip(dels, adds, strict=False):
+            res = intraline(texts[di], texts[ai])
+            if res is None:
+                continue
+            ra, rb = res
+            if ra:
+                out[di] = ra
+            if rb:
+                out[ai] = rb
+    return out
+
+
 def diff_lines(
     path: str,
     rows: list[DiffRow],
     threads: Sequence[Thread],
     width: int,
+    *,
+    threads_old: Sequence[Thread] = (),
+    drafts: Sequence[Draft] = (),
+    new_ps: int = 0,
+    base_ps: Optional[int] = None,
+    notes: Sequence[Line] = (),
 ) -> tuple[list[Line], list[Any]]:
-    """Render diff rows with line numbers and inline comment threads. Returns (lines, meta)."""
+    """Render diff rows with line numbers, intraline highlights, comment threads and drafts.
+
+    ``threads`` belong to ``new_ps`` (REVISION side on the right, PARENT side on the left when the
+    base is the parent commit); ``threads_old`` belong to ``base_ps`` and are shown on the left.
+    Returns (lines, meta); meta holds a LineRef for code lines, ("hunk", i) for hunk headers and
+    ("thread", t) / ("draft", d) for comment lines.
+    """
     nums = [r.old or 0 for r in rows] + [r.new or 0 for r in rows] + [1]
     nw = len(str(max(nums)))
     out: list[Line] = []
     meta: list[Any] = []
-    by_new: dict[int, list[Thread]] = {}
-    by_old: dict[int, list[Thread]] = {}
-    file_level: list[Thread] = []
-    for t in threads:
-        if t.line <= 0:
-            file_level.append(t)
-        elif t.side == "PARENT":
-            by_old.setdefault(t.line, []).append(t)
+    new_anchor: dict[int, list[Any]] = {}
+    old_anchor: dict[int, list[Any]] = {}
+    file_level: list[Any] = []
+
+    def place(item: Any, line: int, old_side: bool) -> None:
+        if line <= 0:
+            file_level.append(item)
         else:
-            by_new.setdefault(t.line, []).append(t)
+            (old_anchor if old_side else new_anchor).setdefault(line, []).append(item)
+
+    for t in threads:
+        place(t, t.line, t.side == "PARENT")
+    for t in threads_old:
+        place(t, t.line, True)
+    for d in drafts:
+        old_side = (d.patch_set == new_ps and d.side == "PARENT") or (base_ps is not None and d.patch_set == base_ps)
+        place(d, d.line, old_side)
     placed: set[int] = set()
     box_w = max(20, width - nw * 2 - 6)
+    indent = " " * (nw * 2 + 2)
 
-    def add_threads(ts: list[Thread]) -> None:
-        for t in ts:
-            if id(t) in placed:
+    def add_items(items: list[Any]) -> None:
+        items = sorted(items, key=lambda it: 1 if isinstance(it, Draft) else 0)
+        for it in items:
+            if id(it) in placed:
                 continue
-            placed.add(id(t))
+            placed.add(id(it))
+            if isinstance(it, Draft):
+                bar = ("▌ ", theme.MAGIC)
+                head: Line = [(indent, PLAIN), bar, ("✎ draft", theme.MAGIC)]
+                if it.is_reply:
+                    head.append((" reply", theme.DIM))
+                head.append((" · unresolved" if it.unresolved else " · resolved", theme.DIM))
+                out.append(head)
+                meta.append(("draft", it))
+                for ln in wrap(sanitize_keep_newlines(it.message), box_w):
+                    out.append([(indent, PLAIN), bar, (ln, PLAIN)])
+                    meta.append(("draft", it))
+                continue
+            t: Thread = it
             glyph, gst = thread_glyph(t)
             bar_style = gst if t.unresolved is not False else theme.DIM
-            indent = " " * (nw * 2 + 2)
             for ci, c in enumerate(t.comments):
-                head: Line = [
+                head = [
                     (indent, PLAIN),
                     ("▌ ", bar_style),
                     (c.author.display, theme.author_style(c.author.username or c.author.name)),
@@ -885,19 +1060,31 @@ def diff_lines(
                     out.append([(indent, PLAIN), ("▌ ", bar_style), (ln, PLAIN)])
                     meta.append(("thread", t))
 
+    for note in notes:
+        out.append(list(note))
+        meta.append(None)
+    if notes:
+        out.append([])
+        meta.append(None)
     if file_level:
         out.append([("File comments", theme.HEADING)])
         meta.append(None)
-        add_threads(file_level)
+        add_items(file_level)
         out.append([])
         meta.append(None)
-    for r in rows:
+
+    texts = [sanitize(r.text) for r in rows]
+    emph = _intraline_ranges(texts, rows)
+    hunk_no = 0
+    for idx, r in enumerate(rows):
+        text = texts[idx]
         if r.kind == "meta":
-            out.append([(sanitize(r.text), theme.BOLD)])
+            out.append([(text, theme.BOLD)])
             meta.append(None)
         elif r.kind == "hunk":
-            out.append([(sanitize(r.text), theme.INFO)])
-            meta.append(None)
+            out.append([(text, theme.INFO)])
+            meta.append(("hunk", hunk_no))
+            hunk_no += 1
         elif r.kind == "nonl":
             out.append([(r.text, theme.DIM)])
             meta.append(None)
@@ -906,28 +1093,33 @@ def diff_lines(
             n = str(r.new) if r.new is not None else ""
             gutter = (f"{o:>{nw}} {n:>{nw}} ", theme.DIM)
             if r.kind == "add":
-                out.append([gutter, ("+" + sanitize(r.text), theme.OK)])
-                meta.append(LineRef(path, r.new or 0, None))
+                body = emphasize(text, emph.get(idx, []), theme.OK, ADD_EMPH)
+                out.append([gutter, ("+", theme.OK)] + body)
+                meta.append(LineRef(path, r.new or 0, None, new_ps, len(text)))
             elif r.kind == "del":
-                out.append([gutter, ("-" + sanitize(r.text), theme.BAD)])
-                meta.append(LineRef(path, r.old or 0, "PARENT"))
+                body = emphasize(text, emph.get(idx, []), theme.BAD, DEL_EMPH)
+                out.append([gutter, ("-", theme.BAD)] + body)
+                if base_ps is not None:
+                    meta.append(LineRef(path, r.old or 0, None, base_ps, len(text)))
+                else:
+                    meta.append(LineRef(path, r.old or 0, "PARENT", new_ps, len(text)))
             else:
-                out.append([gutter, (" " + sanitize(r.text), PLAIN)])
-                meta.append(LineRef(path, r.new or 0, None))
-            if r.new is not None and r.kind in ("add", "ctx") and r.new in by_new:
-                add_threads(by_new[r.new])
-            if r.old is not None and r.kind in ("del", "ctx") and r.old in by_old:
-                add_threads(by_old[r.old])
-    rest = [t for t in threads if id(t) not in placed]
+                out.append([gutter, (" " + text, PLAIN)])
+                meta.append(LineRef(path, r.new or 0, None, new_ps, len(text)))
+            if r.new is not None and r.kind in ("add", "ctx") and r.new in new_anchor:
+                add_items(new_anchor[r.new])
+            if r.old is not None and r.kind in ("del", "ctx") and r.old in old_anchor:
+                add_items(old_anchor[r.old])
+    rest = [it for items in list(new_anchor.values()) + list(old_anchor.values()) for it in items if id(it) not in placed]
     if rest:
         out.append([])
         meta.append(None)
-        out.append([("Comments outside the shown diff context", theme.HEADING)])
+        out.append([("Comments outside the shown diff context (z shows the full file)", theme.HEADING)])
         meta.append(None)
-        for t in rest:
-            out.append([(f"line {t.line}", theme.INFO)])
-            meta.append(("thread", t))
-            add_threads([t])
+        for it in rest:
+            out.append([(f"line {it.line}", theme.INFO)])
+            meta.append(("draft", it) if isinstance(it, Draft) else ("thread", it))
+            add_items([it])
     if not rows:
         out.append([("(no textual changes)", theme.DIM)])
         meta.append(None)

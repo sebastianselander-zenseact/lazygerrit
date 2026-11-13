@@ -292,6 +292,7 @@ class TextPanel:
         self.hscroll = 0
         self.cursor = 0
         self.cursor_mode = False
+        self.anchor: Optional[int] = None
         self.search = ""
         self.rect: Optional[Rect] = None
         self.footer = ""
@@ -320,6 +321,7 @@ class TextPanel:
             self.scroll = 0
             self.hscroll = 0
             self.cursor = 0
+            self.anchor = None
 
     @property
     def width(self) -> int:
@@ -423,7 +425,8 @@ class TextPanel:
                 ln = slice_cells(ln, self.hscroll, inner.w)
             if self.search:
                 ln = highlight_matches(ln, self.search, MATCH)
-            if self.cursor_mode and focused and idx == self.cursor:
+            in_range = self.anchor is not None and min(self.anchor, self.cursor) <= idx <= max(self.anchor, self.cursor)
+            if self.cursor_mode and focused and (idx == self.cursor or in_range):
                 canvas.put_line(inner.y + r, inner.x, restyle(clip(ln, inner.w), SELECTED), inner.w, fill=SELECTED)
             else:
                 canvas.put_line(inner.y + r, inner.x, ln, inner.w)
@@ -1123,6 +1126,202 @@ class PromptPopup(Popup):
                         si.y + i, si.x, [(truncate_str(label, si.w), style)], si.w, fill=style if i == self.sug_sel else None
                     )
                 draw_frame(canvas, srect, title=[("Suggestions", theme.INACTIVE_BORDER)], border=theme.INACTIVE_BORDER)
+
+    def cursor(self) -> Optional[tuple[int, int]]:
+        return self._cursor
+
+
+class ReviewPopup(Popup):
+    """Gerrit's reply dialog: votes, a cover message and the drafts that will be published."""
+
+    def __init__(
+        self,
+        title: str,
+        labels: Sequence[tuple[str, Sequence[int], int]],
+        on_submit: Callable[[dict[str, int], str], None],
+        *,
+        summary: Sequence[Line] = (),
+        message: str = "",
+        focus_message: bool = False,
+        on_editor: Optional[Callable[[dict[str, int], str], None]] = None,
+    ):
+        self.title = title
+        self.labels = [(name, list(values), current) for name, values, current in labels]
+        self.values = {name: current for name, _, current in self.labels}
+        self.on_submit = on_submit
+        self.summary = list(summary)
+        self.buf = TextBuffer(message)
+        self.field = len(self.labels) if (focus_message or not self.labels) else 0
+        self.on_editor = on_editor
+        self._cursor: Optional[tuple[int, int]] = None
+
+    @property
+    def on_message(self) -> bool:
+        return self.field >= len(self.labels)
+
+    @property
+    def message(self) -> str:
+        return self.buf.text
+
+    def _step(self, d: int) -> None:
+        name, values, _ = self.labels[self.field]
+        cur = self.values[name]
+        i = values.index(cur) if cur in values else values.index(0)
+        self.values[name] = values[max(0, min(len(values) - 1, i + d))]
+
+    def _move_field(self, d: int) -> None:
+        self.field = (self.field + d) % (len(self.labels) + 1)
+
+    def submit(self) -> None:
+        self.close()
+        self.on_submit(dict(self.values), self.buf.text.strip("\n"))
+
+    def handle(self, ev: Event) -> bool:
+        if isinstance(ev, Paste):
+            if self.on_message:
+                self.buf.insert(ev.text)
+            return True
+        if not isinstance(ev, Key):
+            return True
+        k = ev.name
+        b = self.buf
+        if k == "<esc>":
+            self.close()
+        elif k == "<enter>":
+            self.submit()
+        elif k in ("<tab>",):
+            self._move_field(1)
+        elif k in ("<backtab>",):
+            self._move_field(-1)
+        elif k == "<c-o>" and self.on_editor:
+            self.close()
+            self.on_editor(dict(self.values), b.text)
+        elif not self.on_message:
+            if k in ("<left>", "-"):
+                self._step(-1)
+            elif k in ("<right>", "+"):
+                self._step(1)
+            elif k == "<down>":
+                self._move_field(1)
+            elif k == "<up>":
+                self._move_field(-1)
+            elif k in ("0", "1", "2"):
+                name, values, _ = self.labels[self.field]
+                if int(k) in values:
+                    self.values[name] = int(k)
+            elif len(k) == 1 or k == "<space>":
+                # Typing anywhere writes the message, so text can never change a vote by accident.
+                self.field = len(self.labels)
+                b.insert(" " if k == "<space>" else k)
+        else:
+            if k in ("<a-enter>", "<c-j>"):
+                b.insert("\n")
+            elif k == "<backspace>":
+                b.backspace()
+            elif k in ("<delete>", "<c-d>"):
+                b.delete()
+            elif k == "<c-w>":
+                b.delete_word()
+            elif k == "<c-u>":
+                b.kill_to_start()
+            elif k == "<c-k>":
+                b.kill_to_end()
+            elif k in ("<left>", "<c-b>"):
+                b.left()
+            elif k in ("<right>", "<c-f>"):
+                b.right()
+            elif k in ("<home>", "<c-a>"):
+                b.home()
+            elif k in ("<end>", "<c-e>"):
+                b.end()
+            elif k == "<up>":
+                if b.row == 0 and self.labels:
+                    self.field = len(self.labels) - 1
+                else:
+                    b.up()
+            elif k == "<down>":
+                b.down()
+            elif k == "<space>":
+                b.insert(" ")
+            elif len(k) == 1:
+                b.insert(k)
+        return True
+
+    def options(self) -> list[tuple[str, str]]:
+        opts = [("Send", "<enter>"), ("Next field", "<tab>")]
+        if self.on_message:
+            opts.append(("New line", "<a-enter>"))
+            if self.on_editor:
+                opts.append(("Editor", "<c-o>"))
+        else:
+            opts.append(("Vote", "←/→"))
+        opts.append(("Cancel (drafts are kept)", "<esc>"))
+        return opts
+
+    def render(self, canvas: Canvas) -> None:
+        w = max(56, min(100, int(canvas.width * 0.6)))
+        inner_w = w - 2
+        rows: list[Line] = []
+        name_w = max((text_width(n) for n, _, _ in self.labels), default=0) + 2
+        for i, (name, values, mine) in enumerate(self.labels):
+            focused = i == self.field
+            ln: Line = [("▶ " if focused else "  ", theme.ACTIVE_BORDER), (name.ljust(name_w), theme.BOLD if focused else PLAIN)]
+            for v in values:
+                text = f"{v:+d}" if v else " 0"
+                chosen = self.values[name] == v
+                if chosen:
+                    style = SELECTED if focused else Style(reverse=True)
+                else:
+                    style = theme.DIM
+                ln += [(" ", PLAIN), (f" {text} ", style)]
+            if mine:
+                ln.append((f"   your vote: {mine:+d}", theme.DIM))
+            rows.append(ln)
+        if self.labels:
+            rows.append([])
+        msg_focus = self.on_message
+        rows.append(
+            [
+                ("▶ " if msg_focus else "  ", theme.ACTIVE_BORDER),
+                ("Message", theme.BOLD if msg_focus else PLAIN),
+                ("  (optional)", theme.DIM),
+            ]
+        )
+        msg_top = len(rows)
+        body_w = inner_w - 4
+        vis: list[str] = []
+        cur = (0, 0)
+        for li, text in enumerate(self.buf.lines):
+            chunks = [text[k : k + body_w] for k in range(0, max(1, len(text)), body_w)] or [""]
+            for ci, chunk in enumerate(chunks):
+                start = ci * body_w
+                if (
+                    li == self.buf.row
+                    and start <= self.buf.col <= start + len(chunk)
+                    and (self.buf.col < start + len(chunk) or ci == len(chunks) - 1)
+                ):
+                    cur = (len(vis), text_width(chunk[: self.buf.col - start]))
+                vis.append(chunk)
+        box_h = max(3, min(8, len(vis)))
+        top = max(0, cur[0] - box_h + 1)
+        for i in range(box_h):
+            j = top + i
+            text = vis[j] if j < len(vis) else ""
+            rows.append([("  ", PLAIN), ("│ ", theme.ACTIVE_BORDER if msg_focus else theme.DIM), (text, PLAIN)])
+        rows.append([])
+        rows += [list(s) for s in self.summary]
+        h = min(len(rows) + 2, canvas.height - 2)
+        rect = centered(canvas, w, h)
+        fill_rect(canvas, rect)
+        inner = rect.inner
+        for i, ln in enumerate(rows[: inner.h]):
+            canvas.put_line(inner.y + i, inner.x, truncate(ln, inner.w), inner.w)
+        self._cursor = None
+        if msg_focus:
+            y = inner.y + msg_top + (cur[0] - top)
+            if y < inner.y + inner.h:
+                self._cursor = (y, min(inner.x + 4 + cur[1], inner.x + inner.w - 1))
+        draw_frame(canvas, rect, title=[(self.title, self.border)], border=self.border)
 
     def cursor(self) -> Optional[tuple[int, int]]:
         return self._cursor

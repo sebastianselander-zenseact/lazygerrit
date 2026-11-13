@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from .gerrit import CommandError, Runner
-from .models import LocalCommit
+from .models import FileInfo, LocalCommit
 
 _FIELD = "\x1f"
 _RECORD = "\x1e"
@@ -194,6 +194,40 @@ class LocalGit:
 
     def show_stat(self, rev: str) -> str:
         return self.git("show", "--no-color", "--stat", "--format=", rev, timeout=60)
+
+    def files_changed(self, base: str, rev: str) -> list[FileInfo]:
+        """Files changed between two commits (like Gerrit's file list, minus /COMMIT_MSG)."""
+        status = self.git("diff", "--no-ext-diff", "--name-status", "-z", "-M", base, rev, timeout=120).split("\0")
+        types: dict[str, tuple[str, Optional[str]]] = {}
+        i = 0
+        while i < len(status) and status[i]:
+            code = status[i][0]
+            if code in "RC":
+                old, new = status[i + 1], status[i + 2]
+                types[new] = ("RENAMED" if code == "R" else "COPIED", old)
+                i += 3
+            else:
+                path = status[i + 1]
+                kind = {"A": "ADDED", "D": "DELETED", "T": "MODIFIED"}.get(code, "MODIFIED")
+                types[path] = (kind, None)
+                i += 2
+        numstat = self.git("diff", "--no-ext-diff", "--numstat", "-z", "-M", base, rev, timeout=120).split("\0")
+        counts: dict[str, tuple[int, int]] = {}
+        i = 0
+        while i < len(numstat) and numstat[i]:
+            ins, dele, path = (numstat[i].split("\t", 2) + ["", ""])[:3]
+            if not path:
+                path = numstat[i + 2]
+                i += 3
+            else:
+                i += 1
+            counts[path] = (int(ins) if ins.isdigit() else 0, int(dele) if dele.isdigit() else 0)
+        files = []
+        for path in sorted(types):
+            kind, old = types[path]
+            ins, dele = counts.get(path, (0, 0))
+            files.append(FileInfo(path=path, type=kind, insertions=ins, deletions=dele, old_path=old))
+        return files
 
     def show_file(self, rev: str, path: str) -> str:
         return self.git("show", f"{rev}:{path}", timeout=60)

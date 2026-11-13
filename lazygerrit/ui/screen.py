@@ -144,7 +144,12 @@ class CursesCanvas(Canvas):
         a = 0
         if self.has_colors and (st.fg != -1 or st.bg != -1):
             fg = downgrade_color(st.fg, self.colors)
-            bg = downgrade_color(st.bg, self.colors)
+            bg = st.bg
+            if bg >= 16 and self.colors < 256:
+                # Subtle 256-colour backgrounds (e.g. intraline highlights) become reverse video.
+                bg = -1
+                a |= curses.A_REVERSE
+            bg = downgrade_color(bg, self.colors)
             a |= curses.color_pair(self._pair(fg, bg))
         if st.bold:
             a |= curses.A_BOLD

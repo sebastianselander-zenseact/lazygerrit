@@ -65,6 +65,7 @@ class Config:
     diff_context: int = 3
     log_reads: bool = False
     nerd_fonts: bool = False
+    state_file: Optional[str] = None
 
     @property
     def base_url(self) -> str:

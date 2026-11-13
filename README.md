@@ -7,8 +7,9 @@ A [lazygit](https://github.com/jesseduffield/lazygit)-style terminal UI for Gerr
 
 It does everything `support/tools/rng.py` does (recheck, slowcheck, regate, priocheck,
 run-selected, prio_high, rebase, towers, topics, hashtags, reviewers, votes, links and
-comments), and adds dashboards, diffs with inline comments, replies, live Zuul status and a
-view of your local stack.
+comments), and adds dashboards, code review (diffs with intraline highlighting, inline comments,
+drafts published Gerrit-style in one go, patch set comparison), live Zuul status and a view of
+your local stack.
 
 ```
 ╭─[1]─Status─────────────────────────────────╮╭─Change 100102──────────────────────────────────────────────────────────────────────────────╮
@@ -86,11 +87,11 @@ underneath shows every command that changed something on Gerrit.
 | `[1] Status` | connection, project → local branch. The main view has a dashboard with counts, the legend and setup hints. |
 | `[2] Changes` | tabs **Outgoing** (`owner:self -is:wip`), **Incoming** (`reviewer:self -owner:self`), **WIP**, **Attention** (`attention:self`), **Closed**, **Query** (press `s`). |
 | `[3] Local stack` | your commits on top of `origin/master`, matched to Gerrit by Change-Id: `✓` in sync, `↑` differs (push needed), `↓` older patch set, `+` not on Gerrit, `M` merged. |
-| `[4] Files - CI` | files of the current patch set (diffs with inline comments), and CI: live Zuul jobs with progress plus the latest Zuul reports, parsed into jobs. |
-| `[5] Comments - Messages` | comment threads (unresolved first; `f` toggles resolved and CI comments, using the same rules as `rng comments`) and the change messages. |
+| `[4] Files - CI` | files of the patch set you are reviewing (`✓` reviewed, `✎` your drafts, `●` unresolved / `○` other comments), and CI: live Zuul jobs with progress plus the latest Zuul reports, parsed into jobs. |
+| `[5] Comments - Messages` | your drafts, then comment threads (unresolved first; `f` toggles resolved and CI comments, using the same rules as `rng comments`) and the change messages. |
 
 List rows: `✓`/`✗` Verified, then Code-Review and Secondary-Review (`+2`, `-1`, `·` = none),
-`●` unresolved comments, owner initials on other people's changes.
+`●` unresolved comments, `✎N` your unpublished drafts, owner initials on other people's changes.
 
 ## Keybindings
 
@@ -109,7 +110,8 @@ Actions apply to every selected change.
 |---|---|---|
 | `r` | CI menu: `r` recheck, `s` slowcheck, `g` regate, `p` priocheck, `R` run-selected picker (jobs from `src_config/premerge`, failed jobs pre-selected), `h` prio_high, `t` recheck tower | `recheck`, `slowcheck`, `regate`, `priocheck`, `runselected`, `prio_high`, `recheck_tower` |
 | `a` | vote: `a` Code-Review +2, `1` +1, `0`, `n` -1, `N` -2, `s` Secondary-Review +1, `S` 0, `x` -1, `l` any label | `codereview`, `secondaryreview` |
-| `c` / `C` | patchset-level comment (multi-line prompt / `$EDITOR`) | |
+| `p` | review dialog: publish all your drafts together with votes and a message | |
+| `c` / `C` | reply to the change: review dialog with the message focused (or `$EDITOR`). With several changes selected: post the same comment on all of them | |
 | `b` | rebase menu: rebase, rebase + recheck, rebase tower, rebase tower + recheck | `rebase [--recheck]`, `rebase_tower` |
 | `t` / `T` | set topic (empty clears it) / on the whole tower | `topic`, `topic_tower` |
 | `#` | hashtags: add, remove, add to tower, prio_high | `hashtag`, `hashtag_tower` |
@@ -134,17 +136,49 @@ If posting a comment fails, the prompt reopens with your text.
 **Local stack**: `enter` files of the change (or the local diff), `P` push menu (`git push origin
 HEAD:refs/for/master`, a selected commit, `%wip`, `%ready`, `%topic=`, `%hashtag=`, `%r=`).
 
-**Files**: `enter` focuses the diff. In the diff, `j`/`k` move a line cursor, `c` comments on that
-line (deleted lines comment on the base side), `r` replies to the thread under the cursor, `{`/`}`
-change the context, `e` opens your editor at the line and `H`/`L` scroll sideways.
 **CI**: `f` cycles the job filter, `o` opens the build page, `r` → `J` run-selected for exactly that job.
+**Messages**: `f` hides/shows CI bot messages.
 
-**Comments**: `r` reply, `d` reply "Done" and resolve, `A` "Ack", `u` reply and toggle resolved,
-`f` filter, `e` open the commented file in `$EDITOR`. **Messages**: `f` hides/shows CI bot
-messages.
+### Code review
 
-Text prompts: `enter` submits, `alt+enter`/`ctrl+j` inserts a newline, pasting multi-line text
-works, `ctrl+o` continues in `$EDITOR`, `tab` completes.
+Comments work like in the Gerrit web UI: everything you write is a **draft** until you publish.
+Drafts are stored in `~/.local/state/lazygerrit/state.json`, so they survive restarts.
+`p` opens the review dialog. Set Code-Review / Secondary-Review with `←`/`→`, write an optional
+message (posted as a resolved patchset-level comment) and press `enter`. All drafts, votes and the
+message go out together, so reviewers get one notification. Drafts on older patch sets are posted
+on those patch sets.
+
+1. Pick a change and press `4` (or `enter`) for its files. `P` views another patch set, `B` compares
+   against an older patch set instead of the parent ("what changed since I last looked").
+2. `enter` opens the diff: line numbers, word-level highlights of what changed in a line, existing
+   comments inline, and a note when other patch sets have comments on the file.
+3. Review and publish with the keys below.
+
+| Diff view key | |
+|---|---|
+| `j`/`k`, `J`/`K`, `g`/`G` | move the line cursor / scroll / top, bottom |
+| `]` / `[` | next / previous hunk |
+| `}` / `{` | next / previous comment thread (including drafts) |
+| `.` / `,` | next / previous file |
+| `c` | draft comment on the line (deleted lines comment on the old side). On a draft: edit it. On a thread: reply |
+| `v` then `c` | select lines and comment on the range |
+| `r` / `d` / `A` / `u` | reply to the thread under the cursor / reply "Done" (resolves) / "Ack" / reply and toggle resolved |
+| `D` | delete the draft under the cursor |
+| `space` | mark the file reviewed and go to the next one |
+| `z` | toggle whole-file view |
+| `P` / `B` | patch set / base to compare against |
+| `p` | publish drafts with a vote and message |
+| `e` / `o` | open the file in `$EDITOR` / in the browser at that line |
+| `esc` | back to the file list |
+
+**Files panel**: `space` toggles reviewed, `P`/`B`/`z` as above, `e` edits the file.
+**Comments panel**: `enter` jumps to the comment in the diff (switching patch set if needed),
+`r`/`d`/`A`/`u` create draft replies, `c` edits a draft, `D` deletes it, `f` filters, `e` opens the
+file in `$EDITOR`.
+
+Text prompts and the review dialog: `enter` submits, `alt+enter`/`ctrl+j` inserts a newline,
+pasting multi-line text works, `ctrl+o` continues in `$EDITOR`, `tab` completes / moves between
+fields. In the review dialog, typing always goes to the message, so text can never change a vote.
 
 ## Hashtags, prio_high and exact comment threads (REST)
 
@@ -173,6 +207,7 @@ side_panel_width = 0.3333
 mouse = true
 dry_run = false
 diff_context = 3
+state_file = "~/.local/state/lazygerrit/state.json"   # drafts and reviewed marks
 
 [bot_names]                  # friendly names for CI accounts
 svc00140 = "Zuul"
@@ -191,7 +226,7 @@ limit = 30
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests -t .   # 70+ tests, no network needed
+python3 -m unittest discover -s tests -t .   # 85+ tests, no network needed
 ./bin/lazygerrit --demo                       # play with the UI offline
 ruff check lazygerrit tests
 ```
@@ -202,5 +237,6 @@ argument splitter and evaluates a subset of the search language, so quoting, JSO
 queries are exercised end to end.
 
 Code map: `gerrit.py` (SSH/REST transport, command log, dry-run) · `backend.py` (queries) ·
-`operations.py` (rng semantics) · `srcrepo.py` (src specifics: CI commands, run-selected jobs,
+`operations.py` (rng semantics, publishing reviews) · `drafts.py` (drafts, reviewed marks) ·
+`ui/review.py` (code review) · `srcrepo.py` (src specifics: CI commands, run-selected jobs,
 priority hashtags) · `parsing.py` (Gerrit JSON, threads, Zuul reports) · `ui/` (curses UI).

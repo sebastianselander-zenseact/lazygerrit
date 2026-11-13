@@ -66,7 +66,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cfg = load_config(args.repo, args.config, overrides)
         runner = Runner(dry_run=cfg.dry_run, log_reads=cfg.log_reads)
         backend = Backend.create(cfg, runner)
-    app = App(backend, cfg, demo=args.demo)
+    from pathlib import Path
+
+    from .drafts import StateStore, default_state_path
+
+    if tmp is not None:
+        state = StateStore(tmp / "state.json")
+    else:
+        state = StateStore(Path(cfg.state_file).expanduser() if cfg.state_file else default_state_path())
+    app = App(backend, cfg, demo=args.demo, state=state)
     if args.query:
         app.custom_query = args.query
         app.custom_query_set = True

@@ -19,11 +19,21 @@ class DiffRow:
 
 @dataclass(frozen=True)
 class LineRef:
-    """What a rendered diff line refers to, for commenting. side None means REVISION."""
+    """What a rendered diff line refers to, for commenting.
+
+    ``side`` None means the REVISION side of ``patch_set``; "PARENT" its base. ``length`` is the
+    line length (used as the end character of range comments).
+    """
 
     path: str
     line: int
     side: Optional[str] = None
+    patch_set: int = 0
+    length: int = 0
+
+    @property
+    def anchor(self) -> tuple[str, int, Optional[str], int]:
+        return (self.path, self.line, self.side, self.patch_set)
 
 
 def parse_unified(text: str) -> list[DiffRow]:
@@ -66,6 +76,14 @@ def parse_unified(text: str) -> list[DiffRow]:
             continue
         rows.append(DiffRow("meta", raw))
     return rows
+
+
+def unified_text_diff(old: str, new: str, context: int = 3) -> list[DiffRow]:
+    """Diff two in-memory texts (e.g. commit messages of two patch sets)."""
+    import difflib
+
+    lines = difflib.unified_diff(old.split("\n"), new.split("\n"), "a", "b", n=context, lineterm="")
+    return parse_unified("\n".join(lines))
 
 
 def file_as_added(text: str) -> list[DiffRow]:
