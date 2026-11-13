@@ -29,13 +29,30 @@ class StateStoreTest(unittest.TestCase):
             self.assertEqual([d["message"] for d in final["drafts"]], ["why not?", "file comment"])
             self.assertEqual(final["reviewed"], {})
 
-    def test_unreadable_state_is_reported_not_fatal(self):
+    def test_unreadable_state_is_backed_up_not_lost(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
             path.write_text("{not json")
             store = StateStore(path)
             self.assertIn("Could not read", store.load_error)
             self.assertEqual(store.draft_counts(), {})
+            store.add_draft(Draft(change=1, patch_set=1, path="a.py", line=1, message="new"))
+            (backup,) = Path(tmp).glob("state.json.corrupt-*")
+            self.assertEqual(backup.read_text(), "{not json")
+            self.assertEqual([d.message for d in StateStore(path).drafts_for(1)], ["new"])
+
+    def test_two_instances_do_not_lose_or_resurrect_each_others_drafts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            a, b = StateStore(path), StateStore(path)
+            d1 = a.add_draft(Draft(change=1, patch_set=1, path="a.py", line=1, message="from a"))
+            b.add_draft(Draft(change=1, patch_set=1, path="a.py", line=2, message="from b"))
+            a.update_draft(d1.id, message="from a, edited")
+            self.assertEqual([d.message for d in StateStore(path).drafts_for(1)], ["from a, edited", "from b"])
+            b.delete_drafts([d1.id])
+            a.toggle_reviewed(1, 1, "a.py")
+            self.assertEqual([d.message for d in StateStore(path).drafts_for(1)], ["from b"])
+            self.assertEqual([d.message for d in a.drafts_for(1)], ["from b"])
 
     def test_comment_input(self):
         d = Draft(

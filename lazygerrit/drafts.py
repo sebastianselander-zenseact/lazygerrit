@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
@@ -10,9 +11,11 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional, TypeVar
 
 from .models import COMMIT_MSG, PATCHSET_LEVEL
+
+T = TypeVar("T")
 
 
 def default_state_path() -> Path:
@@ -70,7 +73,11 @@ class Draft:
 
 
 class StateStore:
-    """Thread-safe JSON-backed store. ``path`` None keeps everything in memory."""
+    """Thread- and multi-process-safe JSON store. ``path`` None keeps everything in memory.
+
+    Every change is a locked read-modify-write of the file, so several lazygerrit instances can
+    share it without dropping or resurrecting each other's drafts.
+    """
 
     def __init__(self, path: Optional[Path]):
         self.path = path
@@ -82,34 +89,40 @@ class StateStore:
 
     # -- persistence ----------------------------------------------------------------------------
 
-    def load(self) -> None:
-        if self.path is None or not self.path.exists():
-            return
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            self.load_error = f"Could not read {self.path}: {e}"
-            return
+    def _parse(self, data: dict) -> tuple[dict[str, Draft], dict[str, list[str]]]:
         known = set(Draft.__dataclass_fields__)
-        with self._lock:
-            for raw in data.get("drafts", []):
-                try:
-                    d = Draft(**{k: v for k, v in raw.items() if k in known})
-                except TypeError:
-                    continue
-                self._drafts[d.id] = d
-            self._reviewed = {k: list(v) for k, v in (data.get("reviewed") or {}).items()}
+        drafts: dict[str, Draft] = {}
+        for raw in data.get("drafts", []):
+            try:
+                d = Draft(**{k: v for k, v in raw.items() if k in known})
+            except TypeError:
+                continue
+            drafts[d.id] = d
+        reviewed = {k: list(v) for k, v in (data.get("reviewed") or {}).items()}
+        return drafts, reviewed
 
-    def save(self) -> None:
-        if self.path is None:
-            return
-        with self._lock:
-            data = {
-                "version": 1,
-                "drafts": [asdict(d) for d in sorted(self._drafts.values(), key=lambda d: d.created)],
-                "reviewed": self._reviewed,
-            }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def _read_disk(self) -> tuple[dict[str, Draft], dict[str, list[str]]]:
+        assert self.path is not None
+        if not self.path.exists():
+            return {}, {}
+        try:
+            return self._parse(json.loads(self.path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError, AttributeError) as e:
+            backup = self.path.with_name(f"{self.path.name}.corrupt-{int(time.time())}")
+            try:
+                os.replace(self.path, backup)
+                self.load_error = f"Could not read {self.path} ({e}); it was moved to {backup}"
+            except OSError:
+                self.load_error = f"Could not read {self.path}: {e}"
+            return {}, {}
+
+    def _write_disk(self, drafts: dict[str, Draft], reviewed: dict[str, list[str]]) -> None:
+        assert self.path is not None
+        data = {
+            "version": 1,
+            "drafts": [asdict(d) for d in sorted(drafts.values(), key=lambda d: d.created)],
+            "reviewed": reviewed,
+        }
         fd, tmp = tempfile.mkstemp(prefix=".state-", dir=str(self.path.parent))
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -122,33 +135,64 @@ class StateStore:
                 pass
             raise
 
+    def _transact(self, fn: Callable[[dict[str, Draft], dict[str, list[str]]], T], write: bool = True) -> T:
+        with self._lock:
+            if self.path is None:
+                return fn(self._drafts, self._reviewed)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path.with_name(self.path.name + ".lock"), "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    drafts, reviewed = self._read_disk()
+                    result = fn(drafts, reviewed)
+                    if write:
+                        self._write_disk(drafts, reviewed)
+                    self._drafts, self._reviewed = drafts, reviewed
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+            return result
+
+    def load(self) -> None:
+        """(Re)read the file, picking up drafts written by other lazygerrit instances."""
+        if self.path is None:
+            return
+        if not self.path.exists():
+            with self._lock:
+                self._drafts, self._reviewed = {}, {}
+            return
+        try:
+            self._transact(lambda drafts, reviewed: None, write=False)
+        except OSError as e:
+            self.load_error = f"Could not read {self.path}: {e}"
+
+    def snapshot(self) -> tuple[dict[str, Draft], dict[str, list[str]]]:
+        """A copy to compare with after load(), to tell whether another instance changed anything."""
+        with self._lock:
+            return dict(self._drafts), {k: list(v) for k, v in self._reviewed.items()}
+
     # -- drafts ---------------------------------------------------------------------------------
 
     def add_draft(self, draft: Draft) -> Draft:
-        with self._lock:
-            self._drafts[draft.id] = draft
-        self.save()
+        self._transact(lambda drafts, reviewed: drafts.__setitem__(draft.id, draft))
         return draft
 
     def update_draft(self, draft_id: str, **changes: object) -> Optional[Draft]:
-        with self._lock:
-            d = self._drafts.get(draft_id)
-            if d is None:
-                return None
-            for k, v in changes.items():
-                setattr(d, k, v)
-        self.save()
-        return d
+        def apply(drafts: dict[str, Draft], reviewed: dict[str, list[str]]) -> Optional[Draft]:
+            d = drafts.get(draft_id)
+            if d is not None:
+                for k, v in changes.items():
+                    setattr(d, k, v)
+            return d
+
+        return self._transact(apply)
 
     def delete_drafts(self, ids: Iterable[str]) -> int:
-        with self._lock:
-            n = 0
-            for i in ids:
-                if self._drafts.pop(i, None) is not None:
-                    n += 1
-        if n:
-            self.save()
-        return n
+        wanted = list(ids)
+
+        def apply(drafts: dict[str, Draft], reviewed: dict[str, list[str]]) -> int:
+            return sum(1 for i in wanted if drafts.pop(i, None) is not None)
+
+        return self._transact(apply) if wanted else 0
 
     def drafts_for(self, change: int) -> list[Draft]:
         with self._lock:
@@ -180,8 +224,10 @@ class StateStore:
             return set(self._reviewed.get(self._key(change, patch_set), []))
 
     def toggle_reviewed(self, change: int, patch_set: int, path: str) -> bool:
-        with self._lock:
-            paths = self._reviewed.setdefault(self._key(change, patch_set), [])
+        key = self._key(change, patch_set)
+
+        def apply(drafts: dict[str, Draft], reviewed: dict[str, list[str]]) -> bool:
+            paths = reviewed.setdefault(key, [])
             if path in paths:
                 paths.remove(path)
                 now = False
@@ -189,6 +235,7 @@ class StateStore:
                 paths.append(path)
                 now = True
             if not paths:
-                self._reviewed.pop(self._key(change, patch_set), None)
-        self.save()
-        return now
+                reviewed.pop(key, None)
+            return now
+
+        return self._transact(apply)

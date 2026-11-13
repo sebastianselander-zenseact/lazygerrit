@@ -1141,13 +1141,17 @@ class ReviewPopup(Popup):
         on_submit: Callable[[dict[str, int], str], None],
         *,
         summary: Sequence[Line] = (),
+        chosen: Optional[dict[str, int]] = None,
+        warning: str = "",
         message: str = "",
         focus_message: bool = False,
         on_editor: Optional[Callable[[dict[str, int], str], None]] = None,
     ):
         self.title = title
+        self.warning = warning
         self.labels = [(name, list(values), current) for name, values, current in labels]
-        self.values = {name: current for name, _, current in self.labels}
+        # ``labels`` carry your current votes; ``chosen`` preselects others (e.g. when reopened after a failure).
+        self.values = {name: (chosen or {}).get(name, current) for name, _, current in self.labels}
         self.on_submit = on_submit
         self.summary = list(summary)
         self.buf = TextBuffer(message)
@@ -1197,18 +1201,14 @@ class ReviewPopup(Popup):
             self.close()
             self.on_editor(dict(self.values), b.text)
         elif not self.on_message:
-            if k in ("<left>", "-"):
+            if k == "<left>":
                 self._step(-1)
-            elif k in ("<right>", "+"):
+            elif k == "<right>":
                 self._step(1)
             elif k == "<down>":
                 self._move_field(1)
             elif k == "<up>":
                 self._move_field(-1)
-            elif k in ("0", "1", "2"):
-                name, values, _ = self.labels[self.field]
-                if int(k) in values:
-                    self.values[name] = int(k)
             elif len(k) == 1 or k == "<space>":
                 # Typing anywhere writes the message, so text can never change a vote by accident.
                 self.field = len(self.labels)
@@ -1262,6 +1262,9 @@ class ReviewPopup(Popup):
         w = max(56, min(100, int(canvas.width * 0.6)))
         inner_w = w - 2
         rows: list[Line] = []
+        if self.warning:
+            rows += [[(part, theme.WARN)] for part in wrap(self.warning, inner_w - 1)]
+            rows.append([])
         name_w = max((text_width(n) for n, _, _ in self.labels), default=0) + 2
         for i, (name, values, mine) in enumerate(self.labels):
             focused = i == self.field

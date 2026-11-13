@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import traceback
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
@@ -25,6 +26,7 @@ from ..drafts import Draft, StateStore
 from ..gerrit import CommandError, CommandEvent, RestError
 from ..models import COMMIT_MSG, Account, Change, CIJob, FileInfo, LocalCommit, Thread
 from ..parsing import ci_messages, ci_state, filter_threads, latest_report, threads_from_change
+from ..renderers import BUILTIN, DiffRenderer, detect_color_scheme
 from ..srcrepo import CI_COMMANDS, discover_run_selected_jobs, known_hashtags, prio_high_hashtags
 from ..zuul import ZuulError
 from . import render, theme
@@ -158,6 +160,11 @@ class App(ReviewMixin):
         self.pending_cursor: Optional[tuple[Any, Callable[[list[Any]], Optional[int]]]] = None
         self._reviewed_now: set[str] = set()
         self.rendered_diff: Any = None
+        self.publishing: set[int] = set()
+        self.seen_ps: dict[int, int] = {}
+        self.own_files: dict[tuple[int, int], set[str]] = {}
+        self.pending_goto: Optional[tuple[int, int, str, Callable[[list[Any]], Optional[int]]]] = None
+        self.last_input = time.monotonic()
         self.context_cache: dict[tuple, list[tuple[int, str]]] = {}
         self.diff_context = cfg.diff_context
         self.main_key: Any = None
@@ -174,6 +181,15 @@ class App(ReviewMixin):
             self.cmdlog_entries.append(CommandEvent("Dry run: write commands are logged but not sent", "", "info"))
         self.last_auto_refresh = time.monotonic()
         self.last_zuul_refresh = time.monotonic()
+        # Diff renderers (delta, difftastic, …); the review view is always one of them.
+        self.renderers: list[DiffRenderer] = list(cfg.diff_renderers)
+        if not any(r.builtin for r in self.renderers):
+            self.renderers.append(BUILTIN)
+        self.renderer_idx = 0
+        self.review_override = False  # showing the review view (to comment) instead of the chosen renderer
+        self.rendered_out: OrderedDict[tuple, Any] = OrderedDict()
+        self.pending_map: Optional[tuple[Any, tuple[str, float]]] = None
+        self.color_scheme = detect_color_scheme(cfg.color_scheme)
         self.bindings: list[Binding] = []
         self._build_bindings()
         self._setup_panels()
@@ -311,6 +327,8 @@ class App(ReviewMixin):
         self.load_tab(self.p_changes.tab)
         self.load_stack()
         self.update_main()
+        if self.cfg.problems:
+            self.error("\n".join(self.cfg.problems), "Problems in config.toml")
         if self.state.load_error:
             self.show_toast(self.state.load_error, error=True, seconds=8)
         elif self.draft_counts:
@@ -329,7 +347,10 @@ class App(ReviewMixin):
             timeout = 90 if (self.busy or self.toast or self.timers) else 500
             ev = self.input.read(timeout)
             if ev is not None:
-                self.handle(ev)
+                try:
+                    self.handle(ev)
+                except Exception as e:  # noqa: BLE001
+                    self.push(MessagePopup("Internal error", "".join(traceback.format_exception(e)), error=True))
                 self.dirty = True
             elif self.busy:
                 self.spin += 1
@@ -421,13 +442,15 @@ class App(ReviewMixin):
             self.timers = [t for t in self.timers if t[0] > now]
             for _, fn in due:
                 fn()
-        if self.cfg.refresh_interval and now - self.last_auto_refresh > self.cfg.refresh_interval:
+        idle = bool(self.cfg.idle_pause) and now - self.last_input > self.cfg.idle_pause
+        if self.cfg.refresh_interval and now - self.last_auto_refresh > self.cfg.refresh_interval and not idle:
             self.last_auto_refresh = now
+            self.reload_drafts()
             self.load_tab(self.p_changes.tab, quiet=True)
             self.load_stack(quiet=True)
             if self.ctx is not None:
                 self.ensure_details(self.ctx, force=True, quiet=True)
-        if self.cfg.zuul_refresh_interval and now - self.last_zuul_refresh > self.cfg.zuul_refresh_interval:
+        if self.cfg.zuul_refresh_interval and now - self.last_zuul_refresh > self.cfg.zuul_refresh_interval and not idle:
             self.last_zuul_refresh = now
             ch = self.ctx_change()
             if ch is not None and ch.open and ch.detailed:
@@ -931,6 +954,7 @@ class App(ReviewMixin):
                 msgs = [m for m in msgs if not m.author.is_bot(tuple(self.cfg.bot_usernames))]
             cp.empty_text = "Loading messages…" if not ch.detailed else "No messages"
             cp.set_items(msgs)
+        self.resume_goto()
 
     def selected_change_number(self) -> Optional[int]:
         src = self.change_source
@@ -978,6 +1002,8 @@ class App(ReviewMixin):
             self.rendered_diff = None
 
     def update_main(self, data_changed: bool = False) -> None:
+        if self.focus != "main":
+            self.review_override = False
         if self.focus == "main" and not data_changed:
             return
         f = self.last_side if self.focus == "main" else self.focus
@@ -1285,11 +1311,24 @@ class App(ReviewMixin):
 
     # ------------------------------------------------------------------ input
 
+    def reload_drafts(self) -> None:
+        """Pick up drafts written by another lazygerrit instance."""
+        before, err = self.state.snapshot(), self.state.load_error
+        self.state.load()
+        if self.state.load_error != err:
+            self.show_toast(self.state.load_error, error=True, seconds=8)
+        if self.state.snapshot() != before:
+            self._drafts_changed()
+
     def handle(self, ev: Event) -> None:
+        if not isinstance(ev, Resize):
+            self.last_input = time.monotonic()
         if isinstance(ev, Resize):
             if isinstance(self.canvas, CursesCanvas):
                 curses.update_lines_cols()
                 self.canvas.resize()
+            # The new size is known after the next render; diffs depend on the width.
+            self.later(0.05, self._rerender_diff)
             return
         if isinstance(ev, Mouse):
             self.handle_mouse(ev)
@@ -1315,7 +1354,8 @@ class App(ReviewMixin):
         f = self.focus
         if f == "main":
             kind = self.main_key[0] if self.main_key else ""
-            mode = "diff" if self.p_main.cursor_mode else (kind if kind in ("thread", "draft") else "text")
+            # Also while a diff is loading or failed, so | and ./, still work.
+            mode = "diff" if self.p_main.cursor_mode or kind == "diff" else (kind if kind in ("thread", "draft") else "text")
             return [f"main:{mode}", "main", "global"]
         if f == "cmdlog":
             return ["main", "global"]
@@ -1532,6 +1572,7 @@ class App(ReviewMixin):
         bind("files:Files", "P", "View another patch set…", self.act_choose_patchset, show="Patch set")
         bind("files:Files", "B", "Compare against base / older patch set…", self.act_choose_base, show="Base")
         bind("files:Files", "z", "Toggle whole-file diffs", self.act_full_file)
+        bind("files:Files", "|", "Switch the diff view (review view, delta, difftastic, …)", self.act_cycle_renderer)
         bind("files:Files", "e", "Edit file", self.act_edit_file)
         bind("files:CI", "<enter>", "Show job details", self.act_focus_main)
         bind("files:CI", "f", "Cycle job filter (all/failed/incl. skipped)", self.act_ci_filter, show="Filter jobs")
@@ -1562,20 +1603,29 @@ class App(ReviewMixin):
         bind("main", "h", "Back to side panel", lambda: self.focus_panel(self.last_side), alts=("<left>",))
         bind("main", "o", "Open in browser", self.act_open, show="Open")
         bind("main", "p", "Review: publish drafts with a vote and message", lambda: self.act_publish(), show=self.publish_bar)
-        bind("main:diff", "c", "Comment on line / range (draft); edit draft under cursor", self.act_comment_line, show="Comment")
-        bind("main:diff", "v", "Select a range of lines", self.act_diff_range)
-        bind("main:diff", "r", "Reply to the thread under the cursor (draft)", lambda: self.act_reply(), show="Reply")
+        rv = self.in_review_view
+        bind(
+            "main:diff",
+            "c",
+            "Comment on line / range (draft); edit draft under cursor",
+            rv(self.act_comment_line),
+            show="Comment",
+        )
+        bind("main:diff", "v", "Select a range of lines", rv(self.act_diff_range))
+        bind("main:diff", "r", "Reply to the thread under the cursor (draft)", rv(lambda: self.act_reply()), show="Reply")
         bind(
             "main:diff", "p", "Review: publish drafts with a vote and message", lambda: self.act_publish(), show=self.publish_bar
         )
-        bind("main:diff", "d", "Reply 'Done' and resolve (draft)", lambda: self.act_reply("Done", True))
-        bind("main:diff", "A", "Reply 'Ack' and resolve (draft)", lambda: self.act_reply("Ack", True))
-        bind("main:diff", "u", "Toggle resolved (reply / draft)", self.act_reply_toggle)
-        bind("main:diff", "D", "Delete the draft under the cursor", self.act_delete_draft)
-        bind("main:diff", "]", "Next hunk", lambda: self.diff_jump_hunk(1), show="Hunk", bar_key="]/[")
-        bind("main:diff", "[", "Previous hunk", lambda: self.diff_jump_hunk(-1))
-        bind("main:diff", "}", "Next comment", lambda: self.diff_jump_comment(1), show="Thread", bar_key="}/{")
-        bind("main:diff", "{", "Previous comment", lambda: self.diff_jump_comment(-1))
+        bind("main:diff", "d", "Reply 'Done' and resolve (draft)", rv(lambda: self.act_reply("Done", True)))
+        bind("main:diff", "A", "Reply 'Ack' and resolve (draft)", rv(lambda: self.act_reply("Ack", True)))
+        bind("main:diff", "u", "Toggle resolved (reply / draft)", rv(self.act_reply_toggle))
+        bind("main:diff", "D", "Delete the draft under the cursor", rv(self.act_delete_draft))
+        bind("main:diff", "]", "Next hunk", rv(lambda: self.diff_jump_hunk(1)), show="Hunk", bar_key="]/[")
+        bind("main:diff", "[", "Previous hunk", rv(lambda: self.diff_jump_hunk(-1)))
+        bind("main:diff", "}", "Next comment", rv(lambda: self.diff_jump_comment(1)), show="Thread", bar_key="}/{")
+        bind("main:diff", "{", "Previous comment", rv(lambda: self.diff_jump_comment(-1)))
+        cycle = "Switch the diff view (review view, delta, difftastic, …)"
+        bind("main:diff", "|", cycle, self.act_cycle_renderer, show="Diff view" if len(self.renderers) > 1 else False)
         bind("main:diff", ".", "Next file", lambda: self.diff_next_file(1), show="File", bar_key="./,")
         bind("main:diff", ",", "Previous file", lambda: self.diff_next_file(-1))
         bind(
@@ -1775,6 +1825,9 @@ class App(ReviewMixin):
     # ------------------------------------------------------------------ actions: generic
 
     def act_refresh(self) -> None:
+        self.reload_drafts()
+        # Retry diff tools that failed (successful renders of a patch set never change).
+        self.rendered_out = OrderedDict((k, v) for k, v in self.rendered_out.items() if isinstance(v, tuple) and not v[0])
         self.load_status()
         self.load_tab(self.p_changes.tab)
         self.load_stack()
@@ -2218,9 +2271,10 @@ class App(ReviewMixin):
 
     def do_vote(self, ts: list[Change], label: str, value: int) -> None:
         def go() -> None:
+            seen = dict(self.seen_ps)
             self.run_op(
                 f"{label}{value:+d} {self.names(ts)}" if value else f"{label} 0 {self.names(ts)}",
-                lambda: [ops.vote(self.be, t, label, value) for t in ops.resolve(self.be, ts, strict=True)],
+                lambda: [ops.vote(self.be, t, label, value) for t in ops.resolve(self.be, ts, strict=True, seen=seen)],
                 refresh=[c.number for c in ts],
             )
 

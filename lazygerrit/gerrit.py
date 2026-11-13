@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from .parsing import parse_query_output
+from .ptyexec import run_in_pty
 
 
 @dataclass
@@ -123,6 +124,55 @@ class Runner:
                 p.terminate()
             except OSError:
                 pass
+
+    def run_tty(
+        self,
+        args: Sequence[str],
+        *,
+        size: tuple[int, int],
+        display: Optional[str] = None,
+        title: str = "",
+        input: Optional[bytes] = None,
+        cwd: Optional[str] = None,
+        env: Optional[dict] = None,
+        timeout: float = 60,
+        ok: Sequence[int] = (0,),
+        dark: bool = True,
+    ) -> CommandResult:
+        """Run a read-only command with its output on a pseudo-terminal of ``size`` (columns, rows).
+
+        stdout and stderr are combined. Never raises for a failing command (check ``returncode``);
+        failures are reported to the command log.
+        """
+        shown = display or shlex.join(args)
+        start = time.monotonic()
+
+        def started(p: Any) -> None:
+            with self._lock:
+                self._procs.add(p)
+
+        def ended(p: Any) -> None:
+            with self._lock:
+                self._procs.discard(p)
+
+        if self._closed:
+            rc, out = 130, "cancelled"
+        else:
+            try:
+                rc, raw = run_in_pty(
+                    args, size=size, input=input, cwd=cwd, env=env, timeout=timeout, dark=dark, on_start=started, on_exit=ended
+                )
+                out = raw.decode("utf-8", "replace")
+            except subprocess.TimeoutExpired:
+                rc, out = 124, f"timed out after {timeout:.0f}s"
+            except FileNotFoundError as e:
+                rc, out = 127, f"{e.filename}: command not found"
+        duration = time.monotonic() - start
+        failed = rc not in ok
+        if failed or self.log_reads:
+            output = out.strip()[-2000:] if failed else ""
+            self.emit(CommandEvent(title or "Command", shown, "error" if failed else "ok", output, duration))
+        return CommandResult(list(args), rc, out, "", duration)
 
     def run(
         self,

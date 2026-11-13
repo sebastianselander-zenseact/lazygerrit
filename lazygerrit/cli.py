@@ -45,8 +45,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.demo:
         from .demo import cleanup_demo, create_demo
 
+        from .config import apply_display_settings
+
         backend, cfg, _server, tmp = create_demo(dry_run=args.dry_run)
-        cfg.mouse = not args.no_mouse
+        apply_display_settings(cfg, args.config)
+        if args.no_mouse:
+            cfg.mouse = False
         backend.runner.log_reads = args.log_reads
     else:
         from .backend import Backend

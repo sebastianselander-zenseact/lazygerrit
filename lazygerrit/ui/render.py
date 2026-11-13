@@ -24,7 +24,7 @@ from ..models import (
 )
 from ..parsing import ci_state, format_duration_ms, is_ci_comment
 from . import theme
-from .text import PLAIN, Line, Style, pad_str, sanitize, text_width, truncate_str, wrap
+from .text import PLAIN, Line, Style, pad_str, plain, sanitize, text_width, truncate_str, wrap
 
 VOTE_GLYPH_OK = "✓"
 VOTE_GLYPH_BAD = "✗"
@@ -984,6 +984,7 @@ def diff_lines(
     threads: Sequence[Thread],
     width: int,
     *,
+    old_path: Optional[str] = None,
     threads_old: Sequence[Thread] = (),
     drafts: Sequence[Draft] = (),
     new_ps: int = 0,
@@ -1100,7 +1101,8 @@ def diff_lines(
                 body = emphasize(text, emph.get(idx, []), theme.BAD, DEL_EMPH)
                 out.append([gutter, ("-", theme.BAD)] + body)
                 if base_ps is not None:
-                    meta.append(LineRef(path, r.old or 0, None, base_ps, len(text)))
+                    # Left side of a patch set comparison: that file as it is in the older patch set.
+                    meta.append(LineRef(old_path or path, r.old or 0, None, base_ps, len(text)))
                 else:
                     meta.append(LineRef(path, r.old or 0, "PARENT", new_ps, len(text)))
             else:
@@ -1124,6 +1126,41 @@ def diff_lines(
         out.append([("(no textual changes)", theme.DIM)])
         meta.append(None)
     return out, meta
+
+
+def diff_code_text(ln: Line) -> str:
+    """The code of a line rendered by diff_lines, without the line numbers and the +/- marker."""
+    return plain(ln[1:])[1:]
+
+
+def map_row(probe: tuple[str, float], lines: Sequence[Line], meta: Optional[Sequence[Any]] = None) -> int:
+    """The row of ``lines`` that best matches ``probe`` (text, relative position) taken from another
+    view of the same diff, to keep the cursor on the same code when switching views.
+
+    With ``meta`` (diff_lines' output) only code lines are candidates, and they match when their code
+    appears in the probe; otherwise any line matches that contains the probe. Ties go to the line
+    closest to the same relative position, which is also the fallback.
+    """
+    text, ratio = probe
+    n = len(lines)
+    if not n:
+        return 0
+    want = " ".join(text.split())
+    best: Optional[tuple[tuple[bool, int, float], int]] = None
+    for i, ln in enumerate(lines):
+        pos = abs(i / max(1, n - 1) - ratio)
+        if meta is not None:
+            if i >= len(meta) or not isinstance(meta[i], LineRef):
+                continue
+            code = " ".join(diff_code_text(ln).split())
+            hit = len(code) >= 4 and code in want
+            score = (not hit, -len(code) if hit else 0, pos)
+        else:
+            hit = len(want) >= 4 and want in " ".join(plain(ln).split())
+            score = (not hit, 0, pos)
+        if best is None or score < best[0]:
+            best = (score, i)
+    return best[1] if best else round(ratio * (n - 1))
 
 
 def cmdlog_lines(entries: Sequence[Any], width: int) -> list[Line]:

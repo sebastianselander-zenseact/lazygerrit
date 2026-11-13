@@ -286,7 +286,8 @@ def wrap_line(ln: Line, width: int) -> list[Line]:
 
 # --- ANSI SGR parsing -------------------------------------------------------------------------
 
-_ANSI_RE = re.compile(r"\x1b\[([0-9;:]*)([A-Za-z])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-Za-z]")
+# CSI (SGR and the rest, e.g. "\x1b[K" or "\x1b[?25l"), OSC (e.g. hyperlinks), charset and other escapes.
+_ANSI_RE = re.compile(r"\x1b\[([0-?]*)[ -/]*([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-Za-z]|\x1b[@-Z\\^_=>78]")
 
 _CUBE = [0, 95, 135, 175, 215, 255]
 
@@ -377,7 +378,7 @@ def ansi_to_lines(text: str) -> list[Line]:
         for m in _ANSI_RE.finditer(raw):
             if m.start() > pos:
                 cur.append((sanitize(raw[pos : m.start()]), style))
-            if m.group(2) == "m":
+            if m.group(2) == "m" and (m.group(1) or "")[:1] not in ("<", "=", ">", "?"):
                 style = _apply_sgr(m.group(1) or "", style)
             pos = m.end()
         if pos < len(raw):

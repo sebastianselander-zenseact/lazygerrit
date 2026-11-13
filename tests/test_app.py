@@ -1,21 +1,32 @@
+import dataclasses
+import shlex
+import sys
+import tempfile
+import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from lazygerrit.demo import GerritFailure, cleanup_demo, create_demo
+from lazygerrit.demo import _FILES_BASE, ME, GerritFailure, _commit, _run, cleanup_demo, create_demo
 from lazygerrit.diff import LineRef
+from lazygerrit.drafts import Draft, StateStore
+from lazygerrit.renderers import DiffRenderer
 from lazygerrit.ui.app import App
 from lazygerrit.ui.screen import Key, Paste, VirtualCanvas
+from lazygerrit.ui.text import plain
 from lazygerrit.ui.widgets import ConfirmPopup, MenuPopup, MessagePopup, PromptPopup, ReviewPopup
 
 
 class AppTestCase(unittest.TestCase):
     dry_run = False
+    renderers: list = []
 
     def setUp(self):
         self.be, self.cfg, self.server, self.tmp = create_demo(latency=0, dry_run=self.dry_run)
         self.cfg.refresh_interval = 0
         self.cfg.zuul_refresh_interval = 0
+        self.cfg.diff_renderers = [dataclasses.replace(r) for r in self.renderers]
         self.app = App(self.be, self.cfg, demo=True)
         self.app.canvas = VirtualCanvas(160, 45)
         self.app.start()
@@ -53,6 +64,17 @@ class AppTestCase(unittest.TestCase):
         idx = next(i for i, c in enumerate(p.view()) if c.number == number)
         self.press(*(["k"] * p.selected), *(["j"] * idx))
         self.assertEqual(p.current().number, number)
+
+    def open_diff(self, number, file_index=1):
+        self.select_change(number)
+        self.press("4", *(["j"] * file_index), "<enter>")
+        self.assertEqual(self.app.focus, "main")
+
+    def upload_new_patch_set(self, number):
+        ch = self.server.changes[number]
+        last = ch["_patchsets"][-1]
+        n = last["number"] + 1
+        ch["_patchsets"].append(dict(last, number=n, approvals=[], ref=f"refs/changes/{number % 100:02d}/{number}/{n}"))
 
 
 class LayoutAndNavigationTest(AppTestCase):
@@ -190,12 +212,6 @@ class ActionsTest(AppTestCase):
 
 
 class ReviewRegressionTest(AppTestCase):
-    def upload_new_patch_set(self, number):
-        ch = self.server.changes[number]
-        last = ch["_patchsets"][-1]
-        n = last["number"] + 1
-        ch["_patchsets"].append(dict(last, number=n, approvals=[], ref=f"refs/changes/{number % 100:02d}/{number}/{n}"))
-
     def test_actions_target_the_current_patch_set(self):
         self.select_change(100102)
         self.upload_new_patch_set(100102)
@@ -240,11 +256,6 @@ class ReviewRegressionTest(AppTestCase):
 
 
 class CodeReviewTest(AppTestCase):
-    def open_diff(self, number, file_index=1):
-        self.select_change(number)
-        self.press("4", *(["j"] * file_index), "<enter>")
-        self.assertEqual(self.app.focus, "main")
-
     def cursor_to(self, line, side=None):
         meta = self.app.p_main.meta
         target = next(i for i, m in enumerate(meta) if isinstance(m, LineRef) and m.line == line and m.side == side)
@@ -294,6 +305,111 @@ class CodeReviewTest(AppTestCase):
         self.type("lgtm -")
         self.assertEqual(self.app.popups[-1].values, {"Code-Review": 0, "Secondary-Review": 0})
         self.assertEqual(self.app.popups[-1].message, "lgtm -")
+        self.press("<esc>", "p")
+        self.type("-2 +1")
+        self.assertEqual(self.app.popups[-1].values, {"Code-Review": 0, "Secondary-Review": 0})
+        self.assertEqual(self.app.popups[-1].message, "-2 +1")
+
+    def test_failed_publish_reopens_the_dialog_of_that_change_and_blocks_double_publish(self):
+        self.select_change(100101)
+        gate = threading.Event()
+
+        def slow_failure(*args, **kwargs):
+            gate.wait(10)
+            raise GerritFailure("fatal: connection lost")
+
+        with mock.patch.object(self.server, "review", side_effect=slow_failure) as review:
+            self.press("p")
+            self.type("lgtm")
+            self.app.handle(Key("<enter>"))
+            self.app.handle(Key("p"))
+            self.assertIn("being published", self.app.popups[-1].message)
+            self.app.handle(Key("<esc>"))
+            self.app.handle(Key("k"))
+            gate.set()
+            self.settle()
+        self.assertEqual(review.call_count, 1)
+        self.assertNotEqual(self.app.p_changes.current().number, 100101)
+        self.assertIsInstance(self.app.popups[-1], MessagePopup)
+        dialog = self.app.popups[-2]
+        self.assertIsInstance(dialog, ReviewPopup)
+        self.assertIn("Review 100101,", dialog.title)
+        self.assertEqual(dialog.message, "lgtm")
+
+    def test_vote_is_refused_when_a_new_patch_set_arrived_while_reading(self):
+        self.open_diff(100101)
+        self.upload_new_patch_set(100101)
+        self.press("R")
+        self.assertEqual(self.app.change(100101).ps, 3)
+        self.press("p")
+        self.assertIn("Votes will be refused", self.screen())
+        self.press("<right>", "<enter>")
+        self.assertEqual(self.writes(), [])
+        self.assertIn("you looked at patch set 2", self.app.popups[-1].message)
+        dialog = self.app.popups[-2]
+        self.assertIsInstance(dialog, ReviewPopup)
+        self.assertEqual(dialog.values["Code-Review"], 1)
+        self.assertNotIn("your vote", self.screen())
+
+    def test_quick_vote_needs_a_diff_of_the_newest_patch_set(self):
+        self.open_diff(100101)
+        self.upload_new_patch_set(100101)
+        self.press("R", "2", "a", "a")
+        self.assertEqual(self.writes(), [])
+        self.assertIn("newest diff you opened is of patch set 2", self.app.popups[-1].message)
+        self.press("<esc>", "4", "j", "<enter>")
+        self.assertEqual(self.app.main_key[2], 3)
+        self.press("2", "a", "a")
+        self.assertEqual(self.writes(), [["review", "--label", "Code-Review=+2", "100101,3"]])
+
+    def test_switching_patch_set_in_the_diff_view(self):
+        self.open_diff(100101)
+        self.assertEqual(self.app.main_key[2], 2)
+        self.press("P", "1")
+        self.assertEqual(self.app.main_key[2], 1)
+        self.assertIn("Use a context manager here.", self.screen())
+
+    def add_rebased_change(self):
+        """Change 100300: ps2 edits spax.py and crop.py and was rebased onto an upstream edit of doc/rapid.md."""
+        repo, now = self.cfg.repo, int(time.time())
+        _run(repo, "checkout", "-q", "--detach", "origin/master")
+        try:
+            ps1_files = dict(_FILES_BASE)
+            ps1_files["stringent/rapid/spax.py"] = ps1_files["stringent/rapid/spax.py"].replace("100", "200")
+            ps1 = _commit(repo, ps1_files, "Tune spax", now - 600)
+            _run(repo, "checkout", "-q", "--detach", "origin/master")
+            upstream = dict(_FILES_BASE, **{"doc/rapid.md": "# Rapid\n\nOpen loop tooling, now documented.\n"})
+            _commit(repo, upstream, "Upstream docs", now - 500)
+            ps2_files = dict(upstream)
+            ps2_files["stringent/rapid/spax.py"] = ps2_files["stringent/rapid/spax.py"].replace("100", "256")
+            ps2_files["stringent/rapid/crop.py"] = ps2_files["stringent/rapid/crop.py"].replace(
+                "open(path).read()", "open(path, 'rb').read()"
+            )
+            ps2 = _commit(repo, ps2_files, "Tune spax", now - 400)
+        finally:
+            _run(repo, "checkout", "-q", "review/100103")
+        self.server.add_change(100300, "Tune spax", ME, [ps1, ps2], hours_ago=0.1)
+        self.press("R")
+
+    def test_comparing_patch_sets_leaves_out_rebase_only_files(self):
+        self.add_rebased_change()
+        self.select_change(100300)
+        self.press("4", "B", "1")
+        ch = self.app.change(100300)
+        paths = [f.path for f in self.app.files_for_view(ch)]
+        self.assertEqual(paths, ["/COMMIT_MSG", "stringent/rapid/crop.py", "stringent/rapid/spax.py"])
+
+        # crop.py is only changed by ps2: Gerrit rejects comments on ps1's side of it.
+        self.press("j", "<enter>")
+        meta = self.app.p_main.meta
+        old = next(i for i, m in enumerate(meta) if isinstance(m, LineRef) and m.patch_set == 1 and m.line == 7)
+        self.press(*(["j"] * (old - self.app.p_main.cursor)))
+        self.press("c")
+        self.assertIsInstance(self.app.popups[-1], MessagePopup)
+        self.assertIn("does not change stringent/rapid/crop.py", self.app.popups[-1].message)
+        self.press("<esc>", "j", "c")
+        self.assertIsInstance(self.app.popups[-1], PromptPopup)
+        self.assertIn("(ps2)", self.app.popups[-1].title)
 
     def test_comment_on_an_older_patch_set(self):
         self.select_change(100101)
@@ -345,6 +461,103 @@ class CodeReviewTest(AppTestCase):
         self.press("<esc>")
         row = next(ln for ln in self.screen().splitlines() if "crop.py" in ln and "+7 -1" in ln)
         self.assertIn("✓M", row)
+
+
+class BackgroundTest(AppTestCase):
+    def test_background_refresh_pauses_while_idle(self):
+        self.cfg.refresh_interval = 1
+        self.cfg.idle_pause = 60
+        with mock.patch.object(self.app, "load_tab") as load_tab:
+            self.app.last_auto_refresh = time.monotonic() - 100
+            self.app.last_input = time.monotonic() - 120
+            self.app.tick()
+            load_tab.assert_not_called()
+            self.app.handle(Key("<f12>"))
+            self.app.tick()
+            load_tab.assert_called_once()
+
+    def test_drafts_written_by_another_instance_show_up_on_refresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            self.app.state = StateStore(path)
+            StateStore(path).add_draft(Draft(change=100102, patch_set=1, path="/PATCHSET_LEVEL", message="hi"))
+            self.press("R")
+            self.assertEqual(self.app.draft_counts, {100102: 1})
+
+
+MARKER = shlex.join([sys.executable, "-c", "import sys\nfor line in sys.stdin: print('» ' + line.rstrip('\\n'))"])
+
+
+class DiffRendererTest(AppTestCase):
+    renderers = [DiffRenderer(command=MARKER, name="marker", color_arg="never")]
+
+    def main_text(self):
+        return [plain(ln) for ln in self.app.p_main.lines]
+
+    def cursor_to_text(self, text):
+        target = next(i for i, t in enumerate(self.main_text()) if text in t)
+        delta = target - self.app.p_main.cursor
+        self.press(*(["j"] * delta if delta > 0 else ["k"] * -delta))
+
+    def test_diffs_show_the_renderer_and_switch_views_at_the_same_line(self):
+        self.open_diff(100101)
+        self.assertTrue(self.app.p_main.title.endswith("· marker"))
+        text = self.main_text()
+        self.assertIn('» +    LOG.info("Cropping %s", path)', text)
+        self.assertTrue(any(t.startswith("1 comment thread") and "c or | shows them" in t for t in text))
+        self.assertEqual(self.app.seen_ps[100101], 2)
+        self.cursor_to_text("» +        data = fh.read()")
+        self.press("|")
+        self.assertNotIn("marker", self.app.p_main.title)
+        meta = self.app.p_main.cursor_meta()
+        self.assertEqual((meta.line, meta.side), (9, None))
+        self.press("k", "|")
+        self.assertTrue(self.app.p_main.title.endswith("· marker"))
+        self.assertEqual(self.main_text()[self.app.p_main.cursor], "» +    with open(path) as fh:")
+
+    def test_comment_keys_open_the_review_view_first(self):
+        self.open_diff(100101)
+        self.cursor_to_text("» +        data = fh.read()")
+        self.press("c")
+        self.assertEqual(self.app.popups, [])
+        self.assertNotIn("marker", self.app.p_main.title)
+        self.assertEqual(self.app.p_main.cursor_meta().line, 9)
+        self.press("c")
+        self.assertIsInstance(self.app.popups[-1], PromptPopup)
+        self.assertIn("crop.py:9", self.app.popups[-1].title)
+        self.press("<esc>", "<esc>")
+        self.assertEqual(self.app.focus, "files")
+        self.assertTrue(self.app.p_main.title.endswith("· marker"))
+
+    def test_commit_message_and_jumping_to_comments(self):
+        self.open_diff(100101, file_index=0)
+        self.assertIn("» +Add DLT log cropping", self.main_text())
+        self.press("<esc>", "5")
+        idx = next(i for i, t in enumerate(self.app.p_comments.view()) if t.patch_set == 2 and t.path.endswith("crop.py"))
+        self.press(*(["j"] * idx), "<enter>")
+        kind, thread = self.app.p_main.cursor_meta()
+        self.assertEqual((kind, thread.line), ("thread", 14))
+        self.assertNotIn("marker", self.app.p_main.title)
+
+
+class BrokenRendererTest(AppTestCase):
+    renderers = [DiffRenderer(command="no-such-diff-tool-xyz --paging=never", name="broken"), DiffRenderer(type="builtin")]
+
+    def test_a_failing_renderer_explains_itself(self):
+        self.open_diff(100101)
+        text = "\n".join(plain(ln) for ln in self.app.p_main.lines)
+        self.assertIn("broken failed (exit status 127):", text)
+        self.assertIn("not found", text)
+        self.assertNotIn(100101, self.app.seen_ps)
+        self.press("|")
+        self.assertIsInstance(self.app.p_main.cursor_meta(), LineRef)
+        self.assertEqual(self.app.seen_ps[100101], 2)
+
+    def test_refresh_retries_a_failed_renderer(self):
+        self.open_diff(100101)
+        self.app.renderers[0].command = "cat"
+        self.press("R")
+        self.assertIn("+def crop_dlt(path):", [plain(ln) for ln in self.app.p_main.lines])
 
 
 class DryRunAppTest(AppTestCase):

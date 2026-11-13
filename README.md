@@ -129,8 +129,10 @@ as rng's `*_tower` commands.
 
 Every write targets the change's *current* patch set, which is queried right before sending, just
 like rng. With several changes selected, they are processed bottom of the relation chain first.
-Votes are the exception: if a newer patch set appeared since lazygerrit showed you the change, the
-vote is refused and you are asked to refresh first, so you never approve code you haven't seen.
+Votes are the exception: if the change has a newer patch set than the one you looked at (the
+newest patch set whose diff you opened, or the one shown when you voted without opening a diff),
+the vote is refused, so you never approve code you haven't seen. The review dialog warns about this
+before you send.
 If posting a comment fails, the prompt reopens with your text.
 
 **Local stack**: `enter` files of the change (or the local diff), `P` push menu (`git push origin
@@ -146,10 +148,17 @@ Drafts are stored in `~/.local/state/lazygerrit/state.json`, so they survive res
 `p` opens the review dialog. Set Code-Review / Secondary-Review with `←`/`→`, write an optional
 message (posted as a resolved patchset-level comment) and press `enter`. All drafts, votes and the
 message go out together, so reviewers get one notification. Drafts on older patch sets are posted
-on those patch sets.
+on those patch sets. If publishing fails, the dialog reopens with your message and votes. While a
+review is being sent, that change's drafts can't be edited and it can't be published twice.
+
+Several lazygerrit instances can run at the same time: every change to the state file is a locked
+read-modify-write, and drafts written by another instance show up on the next refresh (`R`). An
+unreadable state file is moved aside to `state.json.corrupt-<time>` instead of being overwritten.
 
 1. Pick a change and press `4` (or `enter`) for its files. `P` views another patch set, `B` compares
-   against an older patch set instead of the parent ("what changed since I last looked").
+   against an older patch set instead of the parent ("what changed since I last looked"). Like in
+   Gerrit, a comparison lists only files that one of the two patch sets changes itself; files that
+   only differ because of a rebase are left out. Comments on the left side go to the older patch set.
 2. `enter` opens the diff: line numbers, word-level highlights of what changed in a line, existing
    comments inline, and a note when other patch sets have comments on the file.
 3. Review and publish with the keys below.
@@ -166,12 +175,13 @@ on those patch sets.
 | `D` | delete the draft under the cursor |
 | `space` | mark the file reviewed and go to the next one |
 | `z` | toggle whole-file view |
+| `\|` | switch the diff view: review view, delta, difftastic, … (see [Diff tools](#diff-tools-delta-difftastic-)) |
 | `P` / `B` | patch set / base to compare against |
 | `p` | publish drafts with a vote and message |
 | `e` / `o` | open the file in `$EDITOR` / in the browser at that line |
 | `esc` | back to the file list |
 
-**Files panel**: `space` toggles reviewed, `P`/`B`/`z` as above, `e` edits the file.
+**Files panel**: `space` toggles reviewed, `P`/`B`/`z`/`|` as above, `e` edits the file.
 **Comments panel**: `enter` jumps to the comment in the diff (switching patch set if needed),
 `r`/`d`/`A`/`u` create draft replies, `c` edits a draft, `D` deletes it, `f` filters, `e` opens the
 file in `$EDITOR`.
@@ -179,6 +189,42 @@ file in `$EDITOR`.
 Text prompts and the review dialog: `enter` submits, `alt+enter`/`ctrl+j` inserts a newline,
 pasting multi-line text works, `ctrl+o` continues in `$EDITOR`, `tab` completes / moves between
 fields. In the review dialog, typing always goes to the message, so text can never change a vote.
+
+### Diff tools (delta, difftastic, …)
+
+Diffs can be shown with your favourite diff tool instead of the review view, configured like
+lazygit's [`git.diffRenderers`](https://github.com/jesseduffield/lazygit/blob/master/docs/Custom_DiffRenderers.md).
+Entries copied from your lazygit config work as they are (`colorArg` and the other field names
+are accepted). For example, in `~/.config/lazygerrit/config.toml`:
+
+```toml
+[[diff_renderers]]                 # type = "stdinFilter" (the default): git's diff is piped through it
+command = "delta --paging=never"
+
+[[diff_renderers]]                 # git runs it as its external diff program
+type = "extDiff"
+command = "difft --color=always --background={{colorScheme}} --context={{diffContext}}"
+
+[[diff_renderers]]                 # git's own diff with extra arguments
+type = "rawGit"
+args = ["--color-words"]
+name = "color-words"
+```
+
+- Diffs open with the first entry; `|` switches to the next one. The review view (lazygerrit's own,
+  which shows and adds comments) is always in the cycle, at the end unless you place it yourself
+  with `{ type = "builtin" }`, e.g. first to keep it as the default.
+- A diff tool cannot show Gerrit comments, so a line on top tells how many threads and drafts the
+  file has. `c`, `r`, `v` and the other comment and hunk/thread keys switch to the review view on the
+  same line (press the key again to act); `|` goes back. Jumping to a comment from the Comments
+  panel always uses the review view. Leaving the diff returns to your diff tool.
+- The tool runs in a hidden terminal the size of the diff view, so it sizes and colors its output
+  as usual (no `--width` needed). `{{width}}`, `{{columnWidth}}` (one side of a side-by-side
+  view), `{{diffContext}}` (3, or everything when `z` shows whole files) and `{{colorScheme}}`
+  (`dark`/`light`, from `color_scheme` or `$COLORFGBG`) can be used in commands, as can simple
+  conditions like `{{if gt .width 160}}--side-by-side{{end}}`.
+- Commit messages are rendered too. `--demo` uses the diff tools of your config file, so you can
+  try them there.
 
 ## Hashtags, prio_high and exact comment threads (REST)
 
@@ -202,12 +248,17 @@ Optional `~/.config/lazygerrit/config.toml`:
 ```toml
 refresh_interval = 60        # seconds between background refreshes (0 = off)
 zuul_refresh_interval = 20   # live CI polling for the selected change
+idle_pause = 300             # stop background refreshes after this long without input (0 = never)
 limit = 50                   # changes per tab
 side_panel_width = 0.3333
 mouse = true
 dry_run = false
 diff_context = 3
 state_file = "~/.local/state/lazygerrit/state.json"   # drafts and reviewed marks
+color_scheme = "auto"        # dark/light background, for {{colorScheme}} in diff_renderers
+
+[[diff_renderers]]           # optional diff tools, see "Diff tools" above
+command = "delta --paging=never"
 
 [bot_names]                  # friendly names for CI accounts
 svc00140 = "Zuul"
@@ -223,10 +274,20 @@ query = "reviewer:self -owner:self status:open project:{project} -is:reviewed"
 limit = 30
 ```
 
+### Load on Gerrit
+
+Everything goes over one multiplexed SSH connection. Startup runs about a dozen small queries (one
+per tab, the local stack and the selected change). After that lazygerrit refreshes only the visible
+tab, the local stack and the selected change, every `refresh_interval` seconds. It waits until the
+cursor has rested for 120 ms before loading a change and caches change details for 45 s. While CI
+jobs are running it polls Zuul, not Gerrit, every `zuul_refresh_interval` seconds. After
+`idle_pause` seconds without a key press all background refreshing stops, and it resumes on the
+next key. The only expensive query (`--patch-sets` together with `--files`) is never used.
+
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests -t .   # 85+ tests, no network needed
+python3 -m unittest discover -s tests -t .   # 110+ tests, no network needed
 ./bin/lazygerrit --demo                       # play with the UI offline
 ruff check lazygerrit tests
 ```

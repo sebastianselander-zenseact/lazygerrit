@@ -12,9 +12,11 @@ from .. import operations as ops
 from ..diff import LineRef, file_as_added, parse_unified, unified_text_diff
 from ..drafts import Draft
 from ..models import COMMIT_MSG, PATCHSET_LEVEL, Change, FileInfo, PatchSet, Thread
+from ..renderers import BUILTIN, DiffRenderer
+from ..renderers import render as render_with
 from . import render, theme
 from .render import first_line
-from .text import PLAIN, Line, text_block
+from .text import PLAIN, Line, ansi_to_lines, plain, text_block
 from .widgets import MenuItem, ReviewPopup
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -83,14 +85,35 @@ class ReviewMixin:
             self.show_toast("Older patch sets need a local clone (use --repo)", error=True)
             return
 
-        def work() -> list[FileInfo]:
-            git.ensure_commit(view.revision, view.ref)
-            if base is not None:
-                git.ensure_commit(base.revision, base.ref)
-            base_rev = base.revision if base is not None else (view.parents[0] if view.parents else f"{view.revision}^")
-            return [FileInfo(COMMIT_MSG, "ADDED")] + git.files_changed(base_rev, view.revision)
+        def own(ps: PatchSet) -> set[str]:
+            parent = ps.parents[0] if ps.parents else f"{ps.revision}^"
+            paths: set[str] = set()
+            for f in git.files_changed(parent, ps.revision):
+                paths.add(f.path)
+                if f.old_path:
+                    paths.add(f.old_path)
+            return paths
 
-        def done(files: list[FileInfo]) -> None:
+        def work() -> tuple[list[FileInfo], dict[int, set[str]]]:
+            git.ensure_commit(view.revision, view.ref)
+            if base is None:
+                parent = view.parents[0] if view.parents else f"{view.revision}^"
+                return [FileInfo(COMMIT_MSG, "ADDED")] + git.files_changed(parent, view.revision), {}
+            git.ensure_commit(base.revision, base.ref)
+            owns = {view.number: own(view), base.number: own(base)}
+            touched = owns[view.number] | owns[base.number]
+            # Like Gerrit, leave out files that only differ because of a rebase.
+            files = [
+                f
+                for f in git.files_changed(base.revision, view.revision)
+                if f.path in touched or (f.old_path and f.old_path in touched)
+            ]
+            return [FileInfo(COMMIT_MSG, "ADDED")] + files, owns
+
+        def done(result: tuple[list[FileInfo], dict[int, set[str]]]) -> None:
+            files, owns = result
+            for psn, paths in owns.items():
+                self.own_files[(ch.number, psn)] = paths
             self.local_files[key] = files
             if self.ctx == ch.number:
                 self.refresh_ctx_panels()
@@ -112,7 +135,10 @@ class ReviewMixin:
             self.base_ps[n] = base
         self.p_files.tab = 0
         self.refresh_ctx_panels()
-        self.update_main(data_changed=True)
+        if self.focus == "main" and self.main_diff and self.main_diff[0] == n:
+            self._reshow_diff()
+        else:
+            self.update_main(data_changed=True)
         self.show_toast(f"Viewing {self.view_label(ch)}" + ("" if base else " against its parent"))
 
     def act_choose_patchset(self: "App") -> None:
@@ -181,7 +207,7 @@ class ReviewMixin:
     def diff_key(self: "App", ch: Change, f: FileInfo) -> tuple:
         view = self.viewed_ps(ch)
         base = self.base_patchset(ch)
-        return ("diff", ch.number, view.number if view else 0, base.number if base else 0, f.path, self.full_file)
+        return ("diff", ch.number, view.number if view else 0, base.number if base else 0, f.path, self.full_file, f.old_path)
 
     def show_diff(self: "App", f: FileInfo) -> None:
         ch = self.ctx_change()
@@ -193,6 +219,10 @@ class ReviewMixin:
             return
         key = self.diff_key(ch, f)
         self.main_diff = (ch.number, view.number, f.path)
+        renderer = self.diff_renderer()
+        if not renderer.builtin:
+            self._render_external(key, renderer)
+            return
         title = f"Diff · {f.display_path} · ps{view.number}"
         if key in self.diff_rows:
             self._render_diff(key)
@@ -247,23 +277,24 @@ class ReviewMixin:
         self.submit(f"diff:{key}", work, done, failed, label="Loading diff")
 
     def _render_diff(self: "App", key: tuple) -> None:
+        renderer = self.diff_renderer()
+        if not renderer.builtin:
+            self._render_external(key, renderer)
+            return
         rows = self.diff_rows.get(key)
         if rows is None:
             return
-        _, n, view_n, base_n, path, full = key
-        ch = self.change(n)
-        threads = [t for t in self.threads_cache.get(n, ([], False))[0] if t.path == path and not t.is_ci]
+        _, n, view_n, base_n, path, full, old_path = key
+        left_path = old_path if (base_n and old_path) else path
+        all_threads = [t for t in self.threads_cache.get(n, ([], False))[0] if not t.is_ci]
+        threads = [t for t in all_threads if t.path == path]
         new_threads = [t for t in threads if t.patch_set == view_n and (t.side != "PARENT" or not base_n)]
-        old_threads = [t for t in threads if base_n and t.patch_set == base_n and t.side != "PARENT"]
+        old_threads = [t for t in all_threads if base_n and t.path == left_path and t.patch_set == base_n and t.side != "PARENT"]
         drafts = [
             d
             for d in self.state.drafts_for(n)
-            if d.path == path
-            and (
-                d.patch_set == view_n
-                and (d.side != "PARENT" or not base_n)
-                or (base_n and d.patch_set == base_n and d.side != "PARENT")
-            )
+            if (d.path == path and d.patch_set == view_n and (d.side != "PARENT" or not base_n))
+            or (base_n and d.path == left_path and d.patch_set == base_n and d.side != "PARENT")
         ]
         notes: list[Line] = []
         others = sorted({t.patch_set for t in threads if t.patch_set not in (view_n, base_n)})
@@ -275,12 +306,33 @@ class ReviewMixin:
             rows,
             new_threads,
             self.main_width,
+            old_path=left_path,
             threads_old=old_threads,
             drafts=drafts,
             new_ps=view_n,
             base_ps=base_n or None,
             notes=notes,
         )
+        title = self._diff_title(key)
+        first = self.rendered_diff != key
+        self.set_main(key, title, lines, wrap=False, meta=meta, cursor_mode=True)
+        self.rendered_diff = key
+        self.seen_ps[n] = max(self.seen_ps.get(n, 0), view_n)
+        if self.pending_cursor and self.pending_cursor[0] == key:
+            row = self.pending_cursor[1](meta)
+            self.pending_cursor = None
+            if row is not None:
+                self.p_main.set_cursor(row)
+                self.p_main.scroll_to(max(0, row - self.p_main.height // 3))
+                return
+        if self._apply_map(key, lines, meta):
+            return
+        if first:
+            self.p_main.set_cursor(next((i for i, m in enumerate(meta) if isinstance(m, LineRef)), 0))
+
+    def _diff_title(self: "App", key: tuple) -> str:
+        _, n, view_n, base_n, path, full, _old_path = key
+        ch = self.change(n)
         name = "Commit message" if path == COMMIT_MSG else path
         title = f"Diff · {name} · " + (f"ps{base_n}→ps{view_n}" if base_n else f"ps{view_n}")
         if ch is not None and ch.ps != view_n:
@@ -289,18 +341,7 @@ class ReviewMixin:
             title += " · full file"
         if ch is not None and self.state.is_reviewed(n, view_n, path):
             title += " · ✓ reviewed"
-        first = self.rendered_diff != key
-        self.set_main(key, title, lines, wrap=False, meta=meta, cursor_mode=True)
-        self.rendered_diff = key
-        if self.pending_cursor and self.pending_cursor[0] == key:
-            row = self.pending_cursor[1](meta)
-            self.pending_cursor = None
-            if row is not None:
-                self.p_main.set_cursor(row)
-                self.p_main.scroll_to(max(0, row - self.p_main.height // 3))
-                return
-        if first:
-            self.p_main.cursor = next((i for i, m in enumerate(meta) if isinstance(m, LineRef)), 0)
+        return title
 
     def act_full_file(self: "App") -> None:
         self.full_file = not self.full_file
@@ -315,6 +356,205 @@ class ReviewMixin:
             self.show_diff(f or FileInfo(path))
         else:
             self.update_main()
+
+    def _rerender_diff(self: "App") -> None:
+        if self.main_key and self.main_key[0] == "diff" and self.main_diff:
+            self._render_diff(self.main_key)
+
+    # ------------------------------------------------------------------ diff renderers (delta, difftastic, …)
+
+    def diff_renderer(self: "App") -> DiffRenderer:
+        """What diffs are shown with: the chosen renderer, or the review view while commenting."""
+        return BUILTIN if self.review_override else self.renderers[self.renderer_idx]
+
+    def showing_rendered_diff(self: "App") -> bool:
+        key = self.main_key
+        return bool(key) and key[0] == "diff" and not self.diff_renderer().builtin
+
+    def in_review_view(self: "App", fn: Callable[[], None]) -> Callable[[], None]:
+        """Wrap a diff action that needs the review view (comments, hunks): on a renderer's output it
+        switches to the review view at the same line instead."""
+
+        def run() -> None:
+            if self.showing_rendered_diff():
+                self.open_review_view()
+            else:
+                fn()
+
+        return run
+
+    def open_review_view(self: "App") -> None:
+        self.pending_map = (self.main_key, self._cursor_probe())
+        self.review_override = True
+        self.show_toast(f"Review view: comment here · | goes back to {self.renderers[self.renderer_idx].label}")
+        self._reshow_diff()
+
+    def act_cycle_renderer(self: "App") -> None:
+        if len(self.renderers) < 2:
+            self.show_toast("No diff tools configured: add [[diff_renderers]] to config.toml (see the README)", error=True)
+            return
+        key = self.main_key
+        shown = bool(key) and key[0] == "diff"
+        probe = self._cursor_probe() if shown else None
+        if self.review_override:
+            self.review_override = False
+        else:
+            self.renderer_idx = (self.renderer_idx + 1) % len(self.renderers)
+        r = self.diff_renderer()
+        self.show_toast(f"Diff view: {r.label}" + (" (shows and adds comments)" if r.builtin else ""))
+        if shown and probe is not None:
+            self.pending_map = (key, probe)
+            self._reshow_diff()
+
+    def _cursor_probe(self: "App") -> tuple[str, float]:
+        """The text under the cursor and its relative position, to find the same line in another view."""
+        rows, _ = self.p_main.rows()
+        if not rows:
+            return "", 0.0
+        i = max(0, min(self.p_main.cursor, len(rows) - 1))
+        text = render.diff_code_text(rows[i]) if isinstance(self.p_main.cursor_meta(), LineRef) else plain(rows[i])
+        return text, i / max(1, len(rows) - 1)
+
+    def _apply_map(self: "App", key: tuple, lines: list[Line], meta: Optional[list[Any]]) -> bool:
+        pending = self.pending_map
+        if not pending or pending[0] != key:
+            return False
+        self.pending_map = None
+        row = render.map_row(pending[1], lines, meta)
+        self.p_main.set_cursor(row)
+        self.p_main.scroll_to(max(0, row - self.p_main.height // 3))
+        return True
+
+    def _patchset(self: "App", ch: Change, number: int) -> Optional[PatchSet]:
+        if ch.current is not None and ch.current.number == number:
+            return ch.current
+        return ch.patch_set(number)
+
+    def _render_external(self: "App", key: tuple, r: DiffRenderer) -> None:
+        """Show the diff ``key`` as rendered by ``r`` (rendering it in the background first)."""
+        n, view_n = key[1], key[2]
+        view_id = ("rendered", key, self.renderer_idx)
+        ckey = (key, self.renderer_idx, self.main_width, self.color_scheme)
+        title = f"{self._diff_title(key)} · {r.label}"
+        out = self.rendered_out.get(ckey)
+        if out is None:
+            if self._start_render(ckey, key, r) and self.rendered_diff != view_id:
+                self.set_main(key, title, [[(f"Rendering the diff with {r.label}…", theme.DIM)]], wrap=False)
+            return
+        self.rendered_out.move_to_end(ckey)
+        lines: list[Line] = []
+        if isinstance(out, BaseException):
+            lines.append([(f"Could not render the diff with {r.label}:", theme.BAD)])
+            lines += text_block(self.error_text(out), theme.BAD)
+            lines += [[], [("Press | for another diff view, or fix diff_renderers in config.toml.", theme.DIM)]]
+        else:
+            status, body = out
+            note = self._rendered_note(key)
+            if note:
+                lines += [note, []]
+            if status:
+                lines.append([(f"{r.label} failed (exit status {status}):", theme.BAD)])
+                lines += body
+                lines += [[], [("Press | for another diff view, or fix diff_renderers in config.toml.", theme.DIM)]]
+            else:
+                lines += body or [[("(no differences)", theme.DIM)]]
+                self.seen_ps[n] = max(self.seen_ps.get(n, 0), view_n)
+        first = self.rendered_diff != view_id
+        self.set_main(key, title, lines, wrap=False, meta=[None] * len(lines), cursor_mode=True)
+        self.rendered_diff = view_id
+        if not self._apply_map(key, lines, None) and first:
+            self.p_main.set_cursor(0)
+            self.p_main.scroll_to(0)
+
+    def _rendered_note(self: "App", key: tuple) -> Optional[Line]:
+        """A reminder of the comments a renderer cannot show."""
+        _, n, view_n, base_n, path, _full, old_path = key
+        paths = {path, old_path}
+        sets = {view_n, base_n} - {0}
+        threads = [
+            t for t in self.threads_cache.get(n, ([], False))[0] if not t.is_ci and t.path in paths and t.patch_set in sets
+        ]
+        drafts = [d for d in self.state.drafts_for(n) if d.path in paths and d.patch_set in sets]
+        if not threads and not drafts:
+            return None
+        parts = []
+        if threads:
+            unresolved = sum(1 for t in threads if t.unresolved)
+            parts.append(f"{len(threads)} comment thread{'s' if len(threads) != 1 else ''}")
+            if unresolved:
+                parts[-1] += f" ({unresolved} unresolved)"
+        if drafts:
+            parts.append(f"{len(drafts)} draft{'s' if len(drafts) != 1 else ''}")
+        return [(" and ".join(parts) + " on this file", theme.WARN), ("  ·  c or | shows them in the review view", theme.DIM)]
+
+    def _start_render(self: "App", ckey: tuple, key: tuple, r: DiffRenderer) -> bool:
+        _, n, view_n, base_n, path, full, old_path = key
+        ch = self.change(n)
+        view = self._patchset(ch, view_n) if ch else None
+        base = self._patchset(ch, base_n) if ch and base_n else None
+        if ch is None or view is None or (base_n and base is None):
+            return False
+        git = self.be.git
+        if not git.available:
+            note = "Diffs need a local clone of the repository (start lazygerrit inside it or pass --repo)."
+            self.set_main(key, self._diff_title(key), [[(note, theme.DIM)]])
+            return False
+        width, scheme, height = ckey[2], ckey[3], self.p_main.height
+        context = FULL_FILE_CONTEXT if full else self.diff_context
+        message: Optional[str] = None
+        if (
+            path == COMMIT_MSG
+            and base is None
+            and view.number == ch.ps
+            and ch.commit_message
+            and not git.has_commit(view.revision)
+        ):
+            message = render.synth_commit_msg(ch, view, self.change_subjects())
+
+        def work() -> tuple[int, list[Line]]:
+            if path == COMMIT_MSG:
+                new = message
+                if new is None:
+                    git.ensure_commit(view.revision, view.ref)
+                    new = git.commit_message_file(view.revision)
+                old = ""
+                if base is not None:
+                    git.ensure_commit(base.revision, base.ref)
+                    old = git.commit_message_file(base.revision)
+                status, text = render_with(
+                    git, r, texts=("COMMIT_MSG", old, new), width=width, height=height, context=context, color_scheme=scheme
+                )
+            elif path.startswith("/"):
+                return 0, []
+            else:
+                git.ensure_commit(view.revision, view.ref)
+                if base is not None:
+                    git.ensure_commit(base.revision, base.ref)
+                base_rev = base.revision if base is not None else (view.parents[0] if view.parents else f"{view.revision}^")
+                paths = [path] + ([old_path] if old_path and old_path != path else [])
+                status, text = render_with(
+                    git,
+                    r,
+                    base=base_rev,
+                    rev=view.revision,
+                    paths=paths,
+                    width=width,
+                    height=height,
+                    context=context,
+                    color_scheme=scheme,
+                )
+            return status, ansi_to_lines(text)
+
+        def store(value: Any) -> None:
+            self.rendered_out[ckey] = value
+            self.rendered_out.move_to_end(ckey)
+            while len(self.rendered_out) > 20:
+                self.rendered_out.popitem(last=False)
+            if self.main_key == key:
+                self._render_diff(key)
+
+        self.submit(f"render:{ckey}", work, store, store, label=f"Rendering diff ({r.label})")
+        return True
 
     # ------------------------------------------------------------------ diff navigation
 
@@ -461,6 +701,17 @@ class ReviewMixin:
             return
         ref, rng = sel
         n = self.main_diff[0]
+        key = self.main_key
+        if key and key[0] == "diff" and key[3]:
+            own = self.own_files.get((n, ref.patch_set))
+            if own is not None and ref.path not in own and ref.path != COMMIT_MSG:
+                self.error(
+                    f"Patch set {ref.patch_set} itself does not change {ref.path} (it only differs because of a "
+                    "rebase), so Gerrit would reject a comment on it.\n\nPress B and compare against the parent "
+                    "commit to comment on this file.",
+                    "Cannot comment here",
+                )
+                return
         where = ref.path if ref.path != COMMIT_MSG else "Commit message"
         where += f":{rng['start_line']}-{rng['end_line']}" if rng else f":{ref.line}"
         if ref.side == "PARENT":
@@ -491,7 +742,16 @@ class ReviewMixin:
             on_editor=lambda cur: self.edit_text([f"Comment on {where} in {n},{ref.patch_set}"], cur, save),
         )
 
+    def _busy_publishing(self: "App", n: int) -> bool:
+        if n in self.publishing:
+            self.error(f"Your review of {n} is being published right now. Try again when it has finished.", "Publishing")
+            return True
+        return False
+
     def edit_draft(self: "App", d: Draft) -> None:
+        if self._busy_publishing(d.change):
+            return
+
         def save(text: str) -> None:
             if not text.strip():
                 self.state.delete_drafts([d.id])
@@ -516,6 +776,8 @@ class ReviewMixin:
         d = self.current_draft()
         if d is None:
             self.show_toast("Select a draft (✎) to delete it", error=True)
+            return
+        if self._busy_publishing(d.change):
             return
 
         def delete() -> None:
@@ -579,6 +841,8 @@ class ReviewMixin:
     def act_reply_toggle(self: "App") -> None:
         d = self.current_draft()
         if d is not None:
+            if self._busy_publishing(d.change):
+                return
             self.state.update_draft(d.id, unresolved=not d.unresolved)
             self._drafts_changed()
             self.show_toast("Draft marked " + ("unresolved" if not d.unresolved else "resolved"))
@@ -599,17 +863,34 @@ class ReviewMixin:
             return {}
         return {a.label: a.value for a in ch.current.approvals if a.by.username == self.cfg.user}
 
-    def act_publish(self: "App", focus_message: bool = False, message: str = "", votes: Optional[dict[str, int]] = None) -> None:
-        ts = self.need_targets(single=True)
-        if not ts:
-            return
-        ch = ts[0]
+    def act_publish(
+        self: "App",
+        focus_message: bool = False,
+        message: str = "",
+        votes: Optional[dict[str, int]] = None,
+        change: Optional[Change] = None,
+    ) -> None:
+        if change is None:
+            ts = self.need_targets(single=True)
+            if not ts:
+                return
+            change = ts[0]
+        # Reopened after a failure or the editor: use the freshest data for that same change.
+        ch = self.change(change.number) or change
         n = ch.number
+        if self._busy_publishing(n):
+            return
+        shown_ps = self.seen_ps.get(n, ch.ps)
         drafts = self.state.drafts_for(n)
         mine = self._my_votes(ch)
-        chosen = votes or {}
-        labels = [(name, values, chosen.get(name, mine.get(name, 0))) for name, values in (CODE_REVIEW, SECONDARY_REVIEW)]
+        labels = [(name, values, mine.get(name, 0)) for name, values in (CODE_REVIEW, SECONDARY_REVIEW)]
         summary: list[Line] = []
+        warning = ""
+        if shown_ps != ch.ps:
+            warning = (
+                f"⚠ Votes will be refused: you looked at patch set {shown_ps}, but patch set {ch.ps} is current. "
+                f"Open a diff of patch set {ch.ps} first."
+            )
         if drafts:
             summary.append([(f"{len(drafts)} draft comment{'s' if len(drafts) != 1 else ''} will be published:", theme.HEADING)])
             for d in drafts[:10]:
@@ -624,13 +905,13 @@ class ReviewMixin:
             summary.append([("No drafts. Comment on lines in the diff view (c) to add some.", theme.DIM)])
 
         def submit(chosen_votes: dict[str, int], msg: str) -> None:
-            self.do_publish(ch, chosen_votes, msg, mine)
+            self.do_publish(ch, chosen_votes, msg, mine, shown_ps)
 
         def editor(chosen_votes: dict[str, int], msg: str) -> None:
             self.edit_text(
                 [f"Review message for {n},{ch.ps}: {ch.subject}"],
                 msg,
-                lambda text: self.act_publish(focus_message=True, message=text, votes=chosen_votes),
+                lambda text: self.act_publish(focus_message=True, message=text, votes=chosen_votes, change=ch),
             )
 
         self.push(
@@ -639,14 +920,20 @@ class ReviewMixin:
                 labels,
                 submit,
                 summary=summary,
+                chosen=votes,
+                warning=warning,
                 message=message,
                 focus_message=focus_message,
                 on_editor=editor,
             )
         )
 
-    def do_publish(self: "App", ch: Change, votes: dict[str, int], message: str, mine: dict[str, int]) -> None:
+    def do_publish(
+        self: "App", ch: Change, votes: dict[str, int], message: str, mine: dict[str, int], shown_ps: Optional[int] = None
+    ) -> None:
         n = ch.number
+        if self._busy_publishing(n):
+            return
         drafts = self.state.drafts_for(n)
         changed = {k: v for k, v in votes.items() if v != mine.get(k, 0)}
         msg = message.strip()
@@ -656,16 +943,19 @@ class ReviewMixin:
         published: list[str] = []
 
         def work() -> str:
-            return ops.publish_review(self.be, ch, drafts, changed, msg or None, shown_ps=ch.ps, published=published)
+            return ops.publish_review(self.be, ch, drafts, changed, msg or None, shown_ps=shown_ps or ch.ps, published=published)
 
         def after(_: Any) -> None:
+            self.publishing.discard(n)
             self._forget_published(published)
 
         def failed(e: BaseException) -> None:
+            self.publishing.discard(n)
             self._forget_published(e.published if isinstance(e, ops.PartialPublish) else [])
-            self.act_publish(focus_message=bool(msg), message=message, votes=votes)
+            self.act_publish(focus_message=bool(msg), message=message, votes=votes, change=ch)
 
         def go() -> None:
+            self.publishing.add(n)
             self.run_op(f"Review {n}", work, refresh=[n], after=after, on_fail=failed)
 
         if any(v <= -2 for v in changed.values()):
@@ -812,8 +1102,16 @@ class ReviewMixin:
             self.view_ps[n] = ps
         self.base_ps.pop(n, None)
         self.p_files.tab = 0
+        self.pending_goto = None
         self.refresh_ctx_panels()
-        files = self.files_for_view(ch) or []
+        listed = self.files_for_view(ch)
+        if listed is None:
+            self.pending_goto = (n, ps, path, finder)
+            self.focus = "main"
+            self.review_override = True
+            self.set_main(("goto", n, ps, path), "Diff", [[("Loading the files of the patch set…", theme.DIM)]])
+            return
+        files = listed
         idx = next((i for i, f in enumerate(files) if f.path == path), None)
         if idx is not None:
             self.p_files.goto(idx)
@@ -822,7 +1120,21 @@ class ReviewMixin:
             f = FileInfo(path)
         self.pending_cursor = (self.diff_key(ch, f), finder)
         self.focus = "main"
+        self.review_override = True  # comments are shown in the review view
         self.show_diff(f)
+
+    def resume_goto(self: "App") -> None:
+        """Called whenever file lists change: finish a jump that was waiting for one."""
+        if not self.pending_goto:
+            return
+        n, ps, path, finder = self.pending_goto
+        ch = self.ctx_change()
+        if ch is None or ch.number != n or self.main_key != ("goto", n, ps, path):
+            self.pending_goto = None
+            return
+        if self.files_for_view(ch) is not None:
+            self.pending_goto = None
+            self.goto_location(ps, path, finder)
 
     def act_comments_c(self: "App") -> None:
         d = self.current_draft()

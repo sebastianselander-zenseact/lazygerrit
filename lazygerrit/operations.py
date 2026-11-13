@@ -62,12 +62,13 @@ def order_bottom_up(changes: Sequence[Change]) -> list[Change]:
     return out
 
 
-def resolve(be: Backend, changes: Sequence[Change], strict: bool = False) -> list[Target]:
+def resolve(be: Backend, changes: Sequence[Change], strict: bool = False, seen: Optional[dict[int, int]] = None) -> list[Target]:
     """Targets for the *current* patch set of each change, queried right before writing (as rng
     does), ordered bottom of the relation chain first.
 
     With ``strict`` (votes) a newer patch set than the one shown is an error instead of being
-    silently targeted, so nobody approves code they have not seen.
+    silently targeted, so nobody approves code they have not seen. ``seen`` maps change numbers
+    to the newest patch set whose diff was opened; voting on a newer one is refused too.
     """
     fresh: list[Change] = []
     for c in changes:
@@ -76,6 +77,12 @@ def resolve(be: Backend, changes: Sequence[Change], strict: bool = False) -> lis
             raise StaleChange(
                 f"{c.number} has a new patch set ({cur.ps}) since it was loaded here ({c.ps}).\n"
                 "Press R to refresh, have a look at the new patch set, then vote again."
+            )
+        looked = (seen or {}).get(c.number)
+        if strict and looked and looked < cur.ps:
+            raise StaleChange(
+                f"{c.number} is at patch set {cur.ps}, but the newest diff you opened is of patch set {looked}.\n"
+                f"Open a diff of patch set {cur.ps}, then vote again."
             )
         fresh.append(cur)
     return [Target.of(c) for c in order_bottom_up(fresh)]
@@ -274,8 +281,9 @@ def publish_review(
     current = be.light(change.number) or change
     if labels and shown_ps and current.ps != shown_ps:
         raise StaleChange(
-            f"{change.number} has a new patch set ({current.ps}) since it was loaded here ({shown_ps}).\n"
-            "Your drafts are kept. Press R to refresh, look at the new patch set, then publish again."
+            f"{change.number} is at patch set {current.ps}, but you looked at patch set {shown_ps}.\n"
+            f"Your drafts are kept. Press R to refresh if needed, open a diff of patch set {current.ps}, "
+            "then publish again."
         )
     by_ps: dict[int, list[Draft]] = {}
     for d in drafts:

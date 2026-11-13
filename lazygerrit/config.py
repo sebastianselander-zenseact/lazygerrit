@@ -52,6 +52,7 @@ class Config:
     limit: int = 50
     stack_limit: int = 40
     refresh_interval: int = 60
+    idle_pause: int = 300
     zuul_refresh_interval: int = 20
     ssh_multiplex: bool = True
     ssh_options: list[str] = field(default_factory=list)
@@ -66,6 +67,9 @@ class Config:
     log_reads: bool = False
     nerd_fonts: bool = False
     state_file: Optional[str] = None
+    diff_renderers: list[Any] = field(default_factory=list)  # renderers.DiffRenderer
+    color_scheme: str = "auto"
+    problems: list[str] = field(default_factory=list)
 
     @property
     def base_url(self) -> str:
@@ -149,8 +153,34 @@ def _apply(cfg: Config, data: dict[str, Any]) -> None:
                 cfg.tabs.append(Tab("Query", ""))
         elif key == "repo" and value:
             cfg.repo = Path(str(value)).expanduser()
+        elif key.replace("_", "").lower() == "diffrenderers":
+            from .renderers import parse_renderers
+
+            cfg.diff_renderers, problems = parse_renderers(value)
+            cfg.problems += problems
+        elif key.replace("_", "").lower() == "colorscheme":
+            cfg.color_scheme = str(value).lower()
+            if cfg.color_scheme not in ("auto", "dark", "light"):
+                cfg.problems.append(f"color_scheme must be auto, dark or light (not {value!r})")
         elif hasattr(cfg, key):
             setattr(cfg, key, value)
+
+
+DISPLAY_SETTINGS = {"diffrenderers", "colorscheme", "mouse", "sidepanelwidth", "nerdfonts", "diffcontext"}
+
+
+def apply_display_settings(cfg: Config, config_file: Optional[str] = None) -> None:
+    """Apply only the look-and-feel settings of the config file (used by --demo)."""
+    path = Path(config_file).expanduser() if config_file else config_path()
+    if tomllib is None or not path.exists():
+        return
+    try:
+        with path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except (OSError, ValueError) as e:
+        cfg.problems.append(f"Could not read {path}: {e}")
+        return
+    _apply(cfg, {k: v for k, v in data.items() if k.replace("-", "").replace("_", "").lower() in DISPLAY_SETTINGS})
 
 
 def load_config(
