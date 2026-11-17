@@ -148,6 +148,11 @@ class GerritFailure(Exception):
     pass
 
 
+def account_id(account: dict) -> int:
+    """A made-up Gerrit account id for a demo account."""
+    return 1_000_000 + int("".join(ch for ch in account.get("username", "") if ch.isdigit()) or 0)
+
+
 def _acc(name: str, username: str, email: Optional[str] = None) -> dict:
     return {"name": name, "email": email or f"{username}@example.com", "username": username}
 
@@ -268,6 +273,52 @@ class FakeGerritServer:
             )
         if who["username"] not in [r["username"] for r in ch["_reviewers"]] and who["username"] != ch["owner"]["username"]:
             ch["_reviewers"].append(who)
+
+    def write_meta(self, git_dir: str, number: int, ref: str) -> tuple[int, str, str]:
+        """Write the change's comments as Gerrit stores them (NoteDb notes) to ``ref`` in ``git_dir``."""
+        ch = self.changes.get(number)
+        if ch is None:
+            return 128, "", f"fatal: couldn't find remote ref refs/changes/{number % 100:02d}/{number}/meta\n"
+        env = dict(os.environ, GIT_AUTHOR_NAME="Gerrit", GIT_AUTHOR_EMAIL="gerrit@example.com")
+        env.update(GIT_COMMITTER_NAME="Gerrit", GIT_COMMITTER_EMAIL="gerrit@example.com")
+
+        def git(*args: str, input: Optional[str] = None) -> str:
+            cmd = ["git", f"--git-dir={git_dir}", *args]
+            return subprocess.run(cmd, input=input, capture_output=True, text=True, check=True, env=env).stdout.strip()
+
+        revisions = {ps["number"]: ps["revision"] for ps in ch["_patchsets"]}
+        notes: dict[str, list[dict]] = {}
+        with self.lock:
+            comments = sorted(ch["_comments"], key=lambda c: c["_ts"])
+        for c in comments:
+            note: dict[str, Any] = {
+                "key": {"uuid": c["id"], "filename": c["path"], "patchSetId": c["patch_set"]},
+                "lineNbr": c.get("line", 0),
+                "author": {"id": account_id(c["author"])},
+                "writtenOn": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(c["_ts"])),
+                "side": 0 if c.get("side") == "PARENT" else 1,
+                "message": c["message"],
+                "unresolved": c["unresolved"],
+                "revId": revisions.get(c["patch_set"], ""),
+            }
+            if c.get("in_reply_to"):
+                note["parentUuid"] = c["in_reply_to"]
+            r = c.get("range")
+            if r:
+                note["range"] = {
+                    "startLine": r["start_line"],
+                    "startChar": r["start_character"],
+                    "endLine": r["end_line"],
+                    "endChar": r["end_character"],
+                }
+            notes.setdefault(revisions.get(c["patch_set"], "0" * 40), []).append(note)
+        entries = [
+            f"100644 blob {git('hash-object', '-w', '--stdin', input=json.dumps({'comments': items}))}\t{rev}"
+            for rev, items in notes.items()
+        ]
+        tree = git("mktree", input="".join(e + "\n" for e in entries))
+        git("update-ref", ref, git("commit-tree", tree, "-m", "Update patch set"))
+        return 0, "", ""
 
     def comment(
         self,
@@ -824,6 +875,10 @@ class FakeRunner(Runner):
         if args[:1] == ["git"] and "ls-remote" in args:
             tip = self.server.branch_tip
             return 0, (f"{tip}\trefs/heads/master\n" if tip and "refs/heads/master" in args else ""), ""
+        meta = next((a for a in args if a.startswith("+refs/changes/") and "/meta:" in a), None)
+        if args[:1] == ["git"] and "fetch" in args and meta:
+            git_dir = next(a.split("=", 1)[1] for a in args if a.startswith("--git-dir="))
+            return self.server.write_meta(git_dir, int(meta.split("/")[3]), meta.split(":", 1)[1])
         if args[:1] == ["git"] and "fetch" in args:
             return 0, "", ""
         if args[:1] == ["git"] and "push" in args[:5]:

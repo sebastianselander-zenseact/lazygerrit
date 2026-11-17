@@ -289,6 +289,65 @@ def threads_from_rest(data: dict[str, list[dict]]) -> list[Thread]:
     return threads
 
 
+def _notedb_time(written_on: Any) -> Optional[str]:
+    """NoteDb's "2026-11-13T12:43:48Z" in the REST format "2026-11-13 12:43:48.000000000"."""
+    m = re.match(r"(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)(?:\.(\d+))?", str(written_on or ""))
+    return f"{m.group(1)} {m.group(2)}.{(m.group(3) or '').ljust(9, '0')[:9]}" if m else None
+
+
+def threads_from_notedb(notes: list[dict], change: Change) -> list[Thread]:
+    """Exact threads, with ids and resolution, from the comments in a change's meta ref (NoteDb).
+
+    The notes only identify authors by account id, so names come from the SSH query's copy of the
+    same comments (matched on patch set, file, line and text).
+    """
+    by_text: dict[tuple, list[Account]] = defaultdict(list)
+    for ps in change.patch_sets or ([change.current] if change.current else []):
+        for c in ps.comments:
+            by_text[(ps.number, c.path, c.line, c.message)].append(c.author)
+    matched: list[tuple[dict, Optional[Account]]] = []
+    by_id: dict[Any, Account] = {}
+    for note in notes:
+        key = note.get("key") or {}
+        found = by_text.get((key.get("patchSetId"), key.get("filename"), note.get("lineNbr") or 0, note.get("message", "")))
+        who = found.pop(0) if found else None
+        aid = (note.get("author") or {}).get("id")
+        if who is not None and aid is not None:
+            by_id.setdefault(aid, who)
+        matched.append((note, who))
+    data: dict[str, list[dict]] = defaultdict(list)
+    for note, who in matched:
+        key = note.get("key") or {}
+        if not key.get("uuid") or not key.get("filename"):
+            continue
+        aid = (note.get("author") or {}).get("id")
+        who = who or by_id.get(aid) or Account(name=f"Gerrit user {aid}")
+        item: dict[str, Any] = {
+            "id": key["uuid"],
+            "patch_set": key.get("patchSetId"),
+            "author": {"name": who.name, "email": who.email, "username": who.username},
+            "message": note.get("message", ""),
+            "unresolved": bool(note.get("unresolved", False)),
+            "updated": _notedb_time(note.get("writtenOn")),
+        }
+        if note.get("lineNbr"):
+            item["line"] = note["lineNbr"]
+        if note.get("parentUuid"):
+            item["in_reply_to"] = note["parentUuid"]
+        if isinstance(note.get("side"), int) and note["side"] <= 0:
+            item["side"] = "PARENT"
+        r = note.get("range")
+        if isinstance(r, dict):
+            item["range"] = {
+                "start_line": r.get("startLine"),
+                "start_character": r.get("startChar"),
+                "end_line": r.get("endLine"),
+                "end_character": r.get("endChar"),
+            }
+        data[key["filename"]].append(item)
+    return threads_from_rest(dict(data))
+
+
 def _reply_groups(comments: dict[str, Comment]) -> list[list[Comment]]:
     """Union-find over in_reply_to links: each group is one thread."""
     parent = {cid: cid for cid in comments}

@@ -1064,7 +1064,7 @@ class ReviewMixin:
         exact = self.threads_cache.get(n, ([], False))[1]
         hint = "Saved as a draft; publish with p."
         if not exact:
-            hint += " Without REST access the reply is posted at the same line (not threaded)."
+            hint += " The thread's comment ids aren't loaded yet; they are looked up when publishing."
         state = {True: " (resolves)", False: " (unresolves)", None: ""}[resolve]
         self.prompt(
             f"Reply to {t.location}{state}",
@@ -1092,7 +1092,9 @@ class ReviewMixin:
             self.show_toast("Select a comment thread", error=True)
             return
         if t.unresolved is None:
-            self.error("The resolution state is unknown without REST access (add an HTTP password to ~/.netrc).")
+            self.error(
+                "The resolution state isn't known until the change's comments are read from its meta ref; try again in a moment."
+            )
             return
         self.act_reply(resolve=bool(t.unresolved))
 
@@ -1181,9 +1183,16 @@ class ReviewMixin:
             self.show_toast("Nothing to publish (no drafts, vote changes or message)", error=True)
             return
         published: list[str] = []
+        detailed = self.details.get(n) or ch
 
         def work() -> str:
-            return ops.publish_review(self.be, ch, drafts, changed, msg or None, shown_ps=shown_ps or ch.ps, published=published)
+            to_send = drafts
+            if any(d.reply_to_text and not d.in_reply_to for d in to_send):
+                # Replies drafted from SSH data need the id of the comment they answer to join its thread.
+                threads, exact = self.be.threads(detailed, retry=True)
+                if exact:
+                    to_send = ops.link_replies(to_send, threads)
+            return ops.publish_review(self.be, ch, to_send, changed, msg or None, shown_ps=shown_ps or ch.ps, published=published)
 
         def after(_: Any) -> None:
             self.publishing.discard(n)

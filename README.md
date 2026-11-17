@@ -253,20 +253,30 @@ name = "color-words"
 - Commit messages are rendered too. `--demo` uses the diff tools of your config file, so you can
   try them there.
 
-## Hashtags, prio_high and exact comment threads (REST)
+## Comment threads without REST
 
-Gerrit only exposes hashtags and comment thread metadata (ids, resolved state) over its REST API.
-`rng` uses `requests`, which reads `~/.netrc`, and lazygerrit does the same. Create an HTTP password
+Gerrit's SSH queries return comments without ids or resolved state. So, without REST access, lazygerrit
+reads the change's comments from its meta ref (`refs/changes/NN/NNNNNN/meta`, where Gerrit stores
+them) with a `git fetch` over SSH. The fetch goes into a scratch repository in `$XDG_RUNTIME_DIR`,
+which is deleted on exit, never into your repository. That gives exact threads, resolution states,
+and replies (`r`, `d` Done, `A` Ack) that join their thread and resolve or unresolve it. The fetch takes a
+few seconds and repeats only when the change gets new comments or updates. Until it is done, or if
+it fails (see the command log), threads are grouped by file and line from the SSH data. A reply
+written then is still threaded: lazygerrit looks the thread up again when you publish.
+
+## Hashtags and prio_high (REST)
+
+Gerrit only exposes hashtags over its REST API. `rng` uses `requests`, which reads `~/.netrc`, and
+lazygerrit does the same. Create an HTTP password
 at <https://gerrit.cicd.autoheim.net/settings/#HTTPCredentials> and add:
 
 ```
 machine gerrit.cicd.autoheim.net login <your s-number> password <http-password>
 ```
 
-(or export `LAZYGERRIT_HTTP_USER` / `LAZYGERRIT_HTTP_PASSWORD`). Without it everything else works.
-Hashtag/prio_high actions explain how to enable them. Comment threads are rebuilt from the SSH
-data (grouped by file and line, resolution unknown), and replies are placed at the same line instead
-of being threaded.
+(or export `LAZYGERRIT_HTTP_USER` / `LAZYGERRIT_HTTP_PASSWORD`). Without it everything else works,
+and the hashtag/prio_high actions explain how to enable them. With it, comment threads come from
+REST instead of the meta ref.
 
 ## Configuration
 
@@ -314,6 +324,8 @@ jobs are running it polls Zuul, not Gerrit, every `zuul_refresh_interval` second
 `idle_pause` seconds without a key press all background refreshing stops, and it resumes on the
 next key. The only expensive query (`--patch-sets` together with `--files`) is never used. Merge
 checks add a `git ls-remote` every `merge_check_interval` seconds, plus a fetch when the branch moved.
+Without REST, comment threads add one small fetch of the change's meta ref when you open a change
+that got new comments or updates (see [Comment threads without REST](#comment-threads-without-rest)).
 
 ## Development
 

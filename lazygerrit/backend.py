@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import Optional, Sequence
 
 from .config import Config
-from .gerrit import GerritREST, GerritSSH, RestError, Runner
+from .gerrit import CommandError, GerritREST, GerritSSH, RestError, Runner
 from .localgit import LocalGit
 from .models import Change, CIJob, FileInfo, Thread
-from .parsing import parse_change, parse_patchset, parse_zuul_live, threads_from_change, threads_from_rest
+from .parsing import parse_change, parse_patchset, parse_zuul_live, threads_from_change, threads_from_notedb, threads_from_rest
 from .zuul import ZuulClient, ZuulError
 
 LIST_FLAGS = ("--current-patch-set", "--submit-records")
@@ -56,6 +58,10 @@ class Backend:
         self.rest = rest
         self.zuul = zuul
         self.git = git
+        # number -> (key, notes or None if reading them failed, when)
+        self._meta_comments: dict[int, tuple[tuple[int, int], Optional[list[dict]], float]] = {}
+        self._meta_locks: dict[int, threading.Lock] = {}
+        self._meta_guard = threading.Lock()
 
     @classmethod
     def create(cls, cfg: Config, runner: Runner) -> "Backend":
@@ -108,14 +114,43 @@ class Backend:
                 found[ch.change_id] = ch
         return found
 
-    def threads(self, change: Change) -> tuple[list[Thread], bool]:
-        """Comment threads; (threads, exact) where exact means REST data with resolution state."""
+    def threads(self, change: Change, retry: bool = False) -> tuple[list[Thread], bool]:
+        """Comment threads; (threads, exact) where exact means real comment ids and resolution state,
+        from REST or else from the change's meta ref (NoteDb), which git can fetch over SSH.
+        ``retry`` reads the meta ref again even if that failed less than a minute ago."""
         if self.rest is not None:
             try:
                 return threads_from_rest(self.rest.comments(change.number)), True
             except RestError:
                 pass
+        notes = self.meta_comments(change, retry)
+        if notes is not None:
+            return threads_from_notedb(notes, change), True
         return threads_from_change(change), False
+
+    def meta_comments(self, change: Change, retry: bool = False) -> Optional[list[dict]]:
+        """The change's comments from its meta ref (None if it can't be read). Fetched again only when
+        the change was updated or got new comments, or a minute after a failure."""
+        if self.git is None or not self.git.available:
+            return None
+        key = (change.last_updated, sum(len(ps.comments) for ps in change.patch_sets))
+        with self._meta_guard:
+            lock = self._meta_locks.setdefault(change.number, threading.Lock())
+        with lock:  # one fetch of a change at a time; a second caller then gets its result
+            cached = self._meta_comments.get(change.number)
+            if (
+                cached is not None
+                and cached[0] == key
+                and (cached[1] is not None or (not retry and time.monotonic() - cached[2] < 60))
+            ):
+                return cached[1]
+            try:
+                url = f"ssh://{self.ssh.destination}:{self.ssh.port}/{change.project or self.cfg.project}"
+                notes: Optional[list[dict]] = self.git.change_meta_comments(change.number, url)
+            except (CommandError, OSError, ValueError):
+                notes = None  # e.g. the server hides meta refs: approximate threads from the SSH data
+            self._meta_comments[change.number] = (key, notes, time.monotonic())
+            return notes
 
     def zuul_live(self, number: int, patch_set: int) -> list[CIJob]:
         if self.zuul is None:

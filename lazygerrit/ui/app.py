@@ -707,10 +707,11 @@ class App(ReviewMixin):
         self.details[n] = ch
         self.details_at[n] = time.monotonic()
         self._learn(ch)
-        if self.be.rest is None:
+        cached = self.threads_cache.get(n)
+        if self.be.rest is None and not (cached and cached[1]):
+            # Right away from the SSH data; exact threads follow from the change's meta ref.
             self.threads_cache[n] = (threads_from_change(ch), False)
-        else:
-            self.ensure_threads(n, force=True)
+        self.ensure_threads(n, force=True)
         if ch.open:
             self.ensure_zuul(n, ch.ps)
         self.check_merges([ch])
@@ -747,13 +748,18 @@ class App(ReviewMixin):
         self.submit(
             f"threads:{n}",
             lambda: self.be.threads(ch),
-            lambda r: self._threads_loaded(n, r),
+            lambda r: self._threads_loaded(n, r, ch),
             on_error=lambda e: self.background_error(f"Comments of {n}", e),
         )
 
-    def _threads_loaded(self, n: int, result: tuple[list[Thread], bool]) -> None:
+    def _threads_loaded(self, n: int, result: tuple[list[Thread], bool], ch: Optional[Change] = None) -> None:
         self.threads_cache[n] = result
         self.threads_at[n] = time.monotonic()
+        current = self.details.get(n)
+        if ch is not None and current is not None and current is not ch:
+            # The change was reloaded while these were fetched (and a request for it dropped as a
+            # duplicate): get the threads of the reloaded change, e.g. with a reply just published.
+            self.ensure_threads(n, force=True)
         threads, exact = result
         if exact:
             unresolved = any(t.unresolved and not t.is_ci for t in threads)
@@ -1369,7 +1375,9 @@ class App(ReviewMixin):
         def work() -> tuple[str, dict[str, list[str]]]:
             t = tip or git.remote_tip(branch)
             if not t:
-                raise CommandError(f"git ls-remote {git.remote} refs/heads/{branch}", 2, "", f"{branch} was not found on Gerrit")
+                raise CommandError(
+                    f"git ls-remote --heads {git.remote} refs/heads/{branch}", 2, "", f"{branch} was not found on Gerrit"
+                )
             if not git.has_commit(t):
                 git.fetch_branch(branch)
             return t, {rev: git.merge_conflicts(t, rev) for rev in sorted(git.present_commits(revs))}

@@ -671,7 +671,7 @@ def change_details(
             out.append([("Comments  ", theme.LABEL), (text, theme.WARN if unres else theme.DIM)])
         else:
             text = f"{len(human)} comment threads"
-            out.append([("Comments  ", theme.LABEL), (text, PLAIN), (" (resolution needs REST access)", theme.DIM)])
+            out.append([("Comments  ", theme.LABEL), (text, PLAIN), (" (resolution not known yet)", theme.DIM)])
         out.append([])
     if ch.commit_message:
         out.append(heading("Commit message"))
@@ -758,8 +758,8 @@ def thread_view(
         out += comment_block(c, width)
         out.append([])
     if not exact:
-        out.append([("Threads are approximated from SSH data. Add an HTTP password to ~/.netrc for exact", theme.DIM)])
-        out.append([("threads, resolution state and threaded replies.", theme.DIM)])
+        out.append([("Threads are approximated from SSH data until the change's comments are read from its", theme.DIM)])
+        out.append([("meta ref (see the command log if that fails); then they show resolution states.", theme.DIM)])
     return out
 
 
@@ -888,13 +888,8 @@ def status_dashboard(
     if rest:
         out.append(kv("REST", [(f"✓ authenticated as {rest}", theme.OK)], 10))
     else:
-        out.append(
-            kv(
-                "REST",
-                [("not configured", theme.WARN), (" — hashtags/prio_high and exact comment threads need it", theme.DIM)],
-                10,
-            )
-        )
+        needs = "hashtags/prio_high need it" if repo else "hashtags/prio_high and exact comment threads need it"
+        out.append(kv("REST", [("not configured", theme.WARN), (f" — {needs}", theme.DIM)], 10))
         for ln in rest_error.splitlines():
             out.append([("          " + ln, theme.BAD)])
         out.append([("          Create an HTTP password at ", theme.DIM), (f"{base_url}/settings/#HTTPCredentials", theme.LINK)])

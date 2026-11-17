@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import re
 import shlex
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -109,6 +111,8 @@ class LocalGit:
         self._scratch: Optional[str] = None
         self._objects: Optional[str] = None
         self._email: Optional[str] = None
+        self._meta_repo: Optional[str] = None
+        self._meta_lock = threading.Lock()
 
     @property
     def available(self) -> bool:
@@ -256,6 +260,47 @@ class LocalGit:
             self._email = res.stdout.strip().lower()
         return self._email
 
+    def change_meta_comments(self, number: int, url: str) -> list[dict]:
+        """The published comments of a change as Gerrit stores them (NoteDb), with ids, replies and
+        resolution: read from the change's meta ref, fetched from ``url`` (the change's project on
+        Gerrit) into a scratch repository, not this one."""
+        with self._meta_lock:
+            if self._meta_repo is None:
+                scratch = tempfile.mkdtemp(prefix=f"lazygerrit-notedb-{os.getpid()}-", dir=runtime_dir())
+                atexit.register(shutil.rmtree, scratch, True)
+                self.runner.run(["git", "init", "--bare", "--quiet", scratch], env=self.env(), timeout=30)
+                self._meta_repo = scratch
+        repo, local = self._meta_repo, f"refs/meta/{number}"
+        meta = f"refs/changes/{number % 100:02d}/{number}/meta"
+        fetch = ["git", f"--git-dir={repo}", "fetch", "--quiet", "--no-tags", url, f"+{meta}:{local}"]
+        self.runner.run(fetch, env=self.env(), title="Fetch comments", timeout=120)
+        listing = self.runner.run(["git", f"--git-dir={repo}", "ls-tree", "-r", "-z", local], env=self.env(), timeout=30).stdout
+        blobs = [entry.split("\t", 1)[0].split()[2] for entry in listing.split("\0") if entry and " blob " in entry]
+        if not blobs:
+            return []
+        out = self.runner.run(
+            ["git", f"--git-dir={repo}", "cat-file", "--batch"],
+            input=("\n".join(blobs) + "\n").encode(),
+            env=self.env(),
+            timeout=60,
+        ).stdout
+        decoder = json.JSONDecoder()
+        notes: list[dict] = []
+        parsed = 0
+        for m in re.finditer(r"^[0-9a-f]{40} blob \d+\n", out, re.M):
+            try:
+                data, _ = decoder.raw_decode(out, m.end())
+            except ValueError:
+                break
+            if not isinstance(data, dict) or not isinstance(data.get("comments", []), list):
+                break
+            notes += [c for c in data.get("comments", []) if isinstance(c, dict)]
+            parsed += 1
+        if parsed != len(blobs):
+            # e.g. notes in the pre-JSON format of old Gerrit versions: no exact threads rather than missing comments
+            raise ValueError(f"unreadable comment notes in refs/changes/{number % 100:02d}/{number}/meta")
+        return notes
+
     def line_history(self, rev: str, path: str, start: int, end: int, limit: int = 20) -> list[HistoryCommit]:
         """The commits that changed lines ``start``-``end`` of ``path`` as it is in ``rev``, newest first."""
         out = self.git(
@@ -274,7 +319,8 @@ class LocalGit:
 
     def remote_tip(self, branch: str) -> Optional[str]:
         """The commit ``branch`` points to on Gerrit right now (git ls-remote, changes nothing locally)."""
-        out = self.git("ls-remote", self.remote, f"refs/heads/{branch}", title="Branch tip", timeout=60)
+        # --heads makes Gerrit list only branches, not the million refs/changes/* of a big repository.
+        out = self.git("ls-remote", "--heads", self.remote, f"refs/heads/{branch}", title="Branch tip", timeout=60)
         for line in out.splitlines():
             sha, _, ref = line.partition("\t")
             if ref.strip() == f"refs/heads/{branch}":
@@ -331,6 +377,10 @@ class LocalGit:
         if self._scratch:
             shutil.rmtree(self._scratch, ignore_errors=True)
             self._scratch = None
+        with self._meta_lock:
+            if self._meta_repo:
+                shutil.rmtree(self._meta_repo, ignore_errors=True)
+                self._meta_repo = None
 
     def diff(self, base: str, rev: str, paths: Sequence[str], context: int = 3) -> str:
         return self.git(

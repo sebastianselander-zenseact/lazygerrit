@@ -184,6 +184,62 @@ class PublishReviewTest(unittest.TestCase):
             ops.publish_review(self.be, ch, [], {"Code-Review": 2}, shown_ps=ch_ps1)
 
 
+class ReplyLinkingTest(unittest.TestCase):
+    def test_link_replies_by_text_then_by_location(self):
+        from lazygerrit.drafts import Draft
+        from lazygerrit.models import Account, Comment, Thread
+
+        def thread(cid, text, line=3, side=None, rng=None):
+            c = Comment(path="a.py", line=line, author=Account(name="R"), message=text, patch_set=1, id=cid)
+            return Thread(path="a.py", line=line, patch_set=1, comments=[c], unresolved=True, side=side, range=rng)
+
+        def reply(line, text):
+            return Draft(change=1, patch_set=1, path="a.py", line=line, message="Done", unresolved=False, reply_to_text=text)
+
+        rng = {"start_line": 3, "start_character": 0, "end_line": 3, "end_character": 5}
+        threads = [
+            thread("a", "Fix  this\nplease"),
+            thread("b", "And\tthat", side="PARENT", rng=rng),
+            thread("c", "Typo", line=9),
+        ]
+        drafts = [reply(3, "And that"), reply(3, "Fix this"), reply(9, "(edited)"), reply(3, "(edited)"), reply(4, "Fix this")]
+        linked = ops.link_replies(drafts, threads)
+        self.assertEqual([d.in_reply_to for d in linked], ["b", "a", "c", None, None])
+        self.assertEqual((linked[0].side, linked[0].range, linked[0].id), ("PARENT", rng, drafts[0].id))
+        self.assertEqual(linked[3:], drafts[3:])
+
+    def test_done_without_rest_resolves_the_thread(self):
+        """Without REST the threads come from the change's meta ref: a reply drafted from SSH data
+        (no comment ids) joins its thread, so Done resolves it instead of adding a separate comment."""
+        from lazygerrit.drafts import Draft
+
+        be, _, server, tmp = create_demo(latency=0, with_rest=False)
+        self.addCleanup(cleanup_demo, tmp)
+        self.addCleanup(be.close)
+        ch = be.details(100101)
+        threads, exact = be.threads(ch)
+        self.assertTrue(exact)
+        nit = next(t for t in threads if t.path == "stringent/rapid/crop.py" and t.line == 14)
+        self.assertTrue(nit.unresolved)
+        done = Draft(
+            change=100101,
+            patch_set=2,
+            path="stringent/rapid/crop.py",
+            line=14,
+            message="Done",
+            unresolved=False,
+            reply_to_text="Nit: use a constant for the header size?",
+        )
+        ops.publish_review(be, ch, ops.link_replies([done], threads), shown_ps=2)
+        self.assertEqual(server.changes[100101]["_comments"][-1]["in_reply_to"], nit.last.id)
+        after, exact = be.threads(be.details(100101))
+        self.assertTrue(exact)
+        self.assertEqual(len(after), len(threads))
+        t = next(t for t in after if t.root.id == nit.root.id)
+        self.assertEqual([c.message for c in t.comments], ["Nit: use a constant for the header size?", "Done"])
+        self.assertFalse(t.unresolved)
+
+
 class DryRunTest(unittest.TestCase):
     def test_nothing_is_sent(self):
         be, cfg, server, tmp = create_demo(latency=0, dry_run=True)

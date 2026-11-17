@@ -241,7 +241,12 @@ class GerritSSH:
     def ssh_options(self) -> list[str]:
         opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30"]
         if self.control_path:
+            # The master connection only passes on the environment variables in its own SendEnv. git
+            # sends GIT_PROTOCOL=version=2 that way; without it, git over this connection falls back to
+            # protocol v0, where Gerrit first lists every ref of the repository (25 s for src).
             opts += [
+                "-o",
+                "SendEnv=GIT_PROTOCOL",
                 "-o",
                 "ControlMaster=auto",
                 "-o",

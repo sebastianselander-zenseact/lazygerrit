@@ -135,8 +135,8 @@ def inline_comment(
 def reply(be: Backend, number: int, thread: Thread, text: str, resolve: Optional[bool] = None) -> str:
     """Reply to a thread on the patchset it lives on.
 
-    With REST data the reply is threaded (in_reply_to); otherwise a comment is placed at the
-    same location. ``resolve`` None keeps the thread's current state.
+    With exact threads (REST or the change's meta ref) the reply is threaded (in_reply_to);
+    otherwise a comment is placed at the same location. ``resolve`` None keeps the thread's state.
     """
     if resolve is None:
         unresolved = bool(thread.unresolved) if thread.unresolved is not None else False
@@ -326,6 +326,36 @@ def publish_review(
     if message:
         parts.append("message")
     return f"Published {', '.join(parts) or 'review'} on {n}"
+
+
+def _first_line(text: str) -> str:
+    return next((" ".join(ln.split()) for ln in text.splitlines() if ln.strip()), "")
+
+
+def link_replies(drafts: Sequence[Draft], threads: Sequence[Thread]) -> list[Draft]:
+    """Give reply drafts written without comment ids (from SSH data) the id of the thread they answer,
+    so Gerrit adds them to that thread, and Done/Ack resolve it, instead of starting a new comment."""
+    out: list[Draft] = []
+    for d in drafts:
+        target: Optional[Thread] = None
+        if d.reply_to_text and not d.in_reply_to:
+            want = " ".join(d.reply_to_text.split())
+            here = [
+                t
+                for t in threads
+                if t.last.id
+                and t.patch_set == d.patch_set
+                and t.path == d.path
+                and (d.path == PATCHSET_LEVEL or t.line == d.line)
+            ]
+            target = (
+                next((t for t in here if _first_line(t.last.message) == want), None)
+                or next((t for t in here if any(_first_line(c.message) == want for c in t.comments)), None)
+                or (here[0] if len(here) == 1 else None)
+            )
+        # A reply belongs where its thread is: same side, same range (SSH data knows neither).
+        out.append(replace(d, in_reply_to=target.last.id, side=target.side, range=target.range) if target else d)
+    return out
 
 
 def apply_bottom_up(targets: Sequence[Target], fn: Callable[[Target], str], progress: Progress = _noop) -> list[str]:

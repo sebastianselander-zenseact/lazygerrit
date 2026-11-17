@@ -1,11 +1,16 @@
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 
 from lazygerrit.demo import gerrit_split
 from lazygerrit.gerrit import CommandError, GerritSSH, Runner, format_vote, quote_arg
+from lazygerrit.localgit import LocalGit
 
 
 class RecordingRunner(Runner):
@@ -120,6 +125,53 @@ class GerritSSHTest(unittest.TestCase):
         self.assertIn("ControlPath=", ssh.git_ssh_command())
         # One master per lazygerrit process: quitting one instance must not cut off another.
         self.assertIn(f"lazygerrit-{os.getpid()}-", ssh.control_path)
+
+
+class MetaCommentsTest(unittest.TestCase):
+    """Comments read from a change's meta ref (NoteDb), fetched from a real (local) git remote."""
+
+    def setUp(self):
+        tmp = Path(tempfile.mkdtemp(prefix="lazygerrit-test-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.server, self.repo = tmp / "server.git", tmp / "repo"
+        subprocess.run(["git", "init", "-q", "--bare", str(self.server)], check=True)
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "remote", "add", "origin", str(self.server)], check=True)
+        self.git = LocalGit(self.repo, Runner())
+        self.addCleanup(self.git.close)
+
+    def write_meta(self, number, notes):
+        """Store ``notes`` (path in the notes tree -> blob text) as the change's meta ref on the server."""
+        env = dict(os.environ, GIT_INDEX_FILE=str(self.server / "meta-index"))
+        env.update(GIT_AUTHOR_NAME="Gerrit", GIT_AUTHOR_EMAIL="g@example.com", GIT_COMMITTER_NAME="Gerrit")
+        env.update(GIT_COMMITTER_EMAIL="g@example.com")
+
+        def git(*args, input=None):
+            cmd = ["git", f"--git-dir={self.server}", *args]
+            return subprocess.run(cmd, input=input, capture_output=True, text=True, check=True, env=env).stdout.strip()
+
+        for path, text in notes.items():
+            git("update-index", "--add", "--cacheinfo", f"100644,{git('hash-object', '-w', '--stdin', input=text)},{path}")
+        git("update-ref", f"refs/changes/{number % 100:02d}/{number}/meta", git("commit-tree", git("write-tree"), "-m", "Update"))
+
+    def test_reads_every_note(self):
+        a = {"key": {"uuid": "u1", "filename": "a.py", "patchSetId": 1}, "lineNbr": 3, "message": "Fix ✓\n{this}\n"}
+        b = {"key": {"uuid": "u2", "filename": "b.py", "patchSetId": 2}, "lineNbr": 1, "message": "Done", "parentUuid": "u0"}
+        rev1, rev2 = "ab" + "1" * 38, "cd" + "2" * 38
+        # Gerrit fans note paths out into directories once there are many of them
+        self.write_meta(
+            703424, {rev1: json.dumps({"comments": [a]}, indent=2), f"{rev2[:2]}/{rev2[2:]}": json.dumps({"comments": [b]})}
+        )
+        self.assertEqual(sorted(self.git.change_meta_comments(703424, str(self.server)), key=lambda c: c["key"]["uuid"]), [a, b])
+        refs = subprocess.run(["git", "-C", str(self.repo), "for-each-ref"], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(refs, "")  # fetched into a scratch repository, not the user's
+
+    def test_unreadable_or_missing_notes_fail(self):
+        self.write_meta(703425, {"ab" + "1" * 38: "Revision: ab11\nPatch-set: 1\n"})  # pre-JSON format
+        with self.assertRaises(ValueError):
+            self.git.change_meta_comments(703425, str(self.server))
+        with self.assertRaises(CommandError):
+            self.git.change_meta_comments(703426, str(self.server))
 
 
 class RunnerTest(unittest.TestCase):

@@ -11,6 +11,7 @@ from lazygerrit.parsing import (
     parse_zuul_live,
     parse_zuul_report,
     threads_from_change,
+    threads_from_notedb,
     threads_from_rest,
     zuul_merge_failure,
 )
@@ -339,6 +340,46 @@ class ThreadTest(unittest.TestCase):
             ],
         )
         self.assertTrue(all(t.unresolved is None for t in threads))
+
+    def test_notedb_threads(self):
+        """Threads from a change's meta ref: real ids, replies and resolution; names from the SSH data."""
+        robin = {"name": "Robin", "email": "robin@example.com", "username": "s0000002"}
+        ps = change_json()["currentPatchSet"]
+        ps["comments"] = [
+            {"file": "a/b.py", "line": 3, "reviewer": robin, "message": "Fix this"},
+            {"file": "a/b.py", "line": 3, "reviewer": ME, "message": "Done"},
+        ]
+
+        def note(uuid, line, author, written, message, unresolved, **extra):
+            key = {"uuid": uuid, "filename": "a/b.py", "patchSetId": 2}
+            return {"key": key, "lineNbr": line, "author": {"id": author}, "writtenOn": written, "side": 1,
+                    "message": message, "unresolved": unresolved, **extra}  # fmt: skip
+
+        notes = [
+            note(
+                "u1",
+                3,
+                1002,
+                "2026-11-13T12:43:48Z",
+                "Fix this",
+                True,
+                range={"startLine": 3, "startChar": 4, "endLine": 3, "endChar": 9},
+            ),
+            note("u2", 3, 1001, "2026-11-13T13:00:00Z", "Done", False, parentUuid="u1"),
+            note("u3", 1, 1002, "2026-11-13T14:00:00.5Z", "Why?", True, side=0),  # newer than the SSH data
+            note("u4", 2, 7, "2026-11-13T15:00:00Z", "Hm", True),
+        ]
+        threads = threads_from_notedb(notes, parse_change(change_json(currentPatchSet=ps)))
+        by_root = {t.root.id: t for t in threads}
+        fixed = by_root["u1"]
+        self.assertEqual([(c.id, c.author.username) for c in fixed.comments], [("u1", "s0000002"), ("u2", "s0000001")])
+        self.assertFalse(fixed.unresolved)
+        self.assertEqual(fixed.range, {"start_line": 3, "start_character": 4, "end_line": 3, "end_character": 9})
+        self.assertEqual(fixed.last.updated, "2026-11-13 13:00:00.000000000")
+        why = by_root["u3"]
+        self.assertEqual((why.side, why.root.author.username, why.unresolved), ("PARENT", "s0000002", True))
+        self.assertEqual(why.root.updated, "2026-11-13 14:00:00.500000000")
+        self.assertEqual(by_root["u4"].root.author.name, "Gerrit user 7")
 
     def test_ci_comment_detection(self):
         self.assertTrue(is_ci_comment("/PATCHSET_LEVEL", " recheck "))

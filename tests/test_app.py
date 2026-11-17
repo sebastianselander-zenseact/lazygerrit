@@ -13,6 +13,7 @@ from unittest import mock
 from lazygerrit.demo import _FILES_BASE, ME, GerritFailure, _commit, _run, cleanup_demo, create_demo
 from lazygerrit.diff import LineRef
 from lazygerrit.drafts import Draft, StateStore
+from lazygerrit.gerrit import CommandError
 from lazygerrit.renderers import DiffRenderer
 from lazygerrit.ui.app import App
 from lazygerrit.ui.screen import Key, Paste, VirtualCanvas
@@ -23,11 +24,12 @@ from lazygerrit.ui.widgets import ConfirmPopup, MenuPopup, MessagePopup, PromptP
 
 class AppTestCase(unittest.TestCase):
     dry_run = False
+    rest = True
     renderers: list = []
     syntax = "off"
 
     def setUp(self):
-        self.be, self.cfg, self.server, self.tmp = create_demo(latency=0, dry_run=self.dry_run)
+        self.be, self.cfg, self.server, self.tmp = create_demo(latency=0, dry_run=self.dry_run, with_rest=self.rest)
         self.cfg.refresh_interval = 0
         self.cfg.zuul_refresh_interval = 0
         self.cfg.diff_renderers = [dataclasses.replace(r) for r in self.renderers]
@@ -818,6 +820,47 @@ class WorktreeTest(AppTestCase):
         self.press("<enter>")
         self.assertIsInstance(self.app.popups[-1], MessagePopup)
         self.assertIn("already exists", self.app.popups[-1].message)
+
+
+class WithoutRestTest(AppTestCase):
+    """No HTTP password: exact threads come from the change's meta ref, fetched with git over SSH."""
+
+    rest = False
+
+    def select_thread(self, path, line):
+        p = self.app.p_comments
+        idx = next(i for i, t in enumerate(p.view()) if getattr(t, "path", None) == path and t.line == line)
+        self.press(*(["j"] * (idx - p.selected)))
+        return p.current()
+
+    def test_done_replies_in_the_thread_and_resolves_it(self):
+        self.select_change(100101)
+        self.press("5")
+        t = self.select_thread("stringent/rapid/crop.py", 14)
+        self.assertTrue(self.app.threads_cache[100101][1])
+        self.assertTrue(t.unresolved)
+        self.press("d", "p", "<enter>")
+        c = self.server.changes[100101]["_comments"][-1]
+        self.assertEqual((c["message"], c["in_reply_to"], c["unresolved"]), ("Done", t.last.id, False))
+        threads, exact = self.app.threads_cache[100101]
+        resolved = next(x for x in threads if x.root.id == t.root.id)
+        self.assertEqual((exact, resolved.unresolved, len(resolved.comments)), (True, False, 2))
+
+    def test_reply_drafted_before_comment_ids_are_known_joins_its_thread(self):
+        failure = CommandError("git fetch", 128, "", "fatal: couldn't find remote ref")
+        with mock.patch.object(self.be.git, "change_meta_comments", side_effect=failure):
+            self.select_change(100101)
+            self.press("5")
+            self.assertFalse(self.app.threads_cache[100101][1])
+            self.select_thread("stringent/rapid/crop.py", 14)
+            self.press("d")
+        (draft,) = self.app.state.drafts_for(100101)
+        self.assertIsNone(draft.in_reply_to)
+        self.press("p", "<enter>")  # the meta ref is read again (it failed just now) to link the reply
+        nit = next(c for c in self.server.changes[100101]["_comments"] if c["message"].startswith("Nit:"))
+        c = self.server.changes[100101]["_comments"][-1]
+        self.assertEqual((c["message"], c["in_reply_to"], c["unresolved"]), ("Done", nit["id"], False))
+        self.assertEqual(self.app.state.drafts_for(100101), [])
 
 
 class DryRunAppTest(AppTestCase):
