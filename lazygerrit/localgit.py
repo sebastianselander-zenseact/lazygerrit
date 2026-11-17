@@ -427,6 +427,19 @@ class LocalGit:
         self.git("fetch", "--no-tags", "--quiet", self.remote, ref, write=True, title="Fetch change", timeout=300)
         return self.git("checkout", "-B", f"review/{number}-patch{patch_set}", revision, write=True, title="Checkout change")
 
+    def branch_exists(self, name: str) -> bool:
+        res = self.runner.run(
+            ["git", "-C", str(self.repo), "rev-parse", "--verify", "--quiet", f"refs/heads/{name}"],
+            env=self.env(),
+            check=False,
+            timeout=15,
+        )
+        return res.returncode == 0
+
+    def add_worktree(self, path: str, revision: str, branch: str) -> str:
+        """``git worktree add -b branch path revision``: a new checkout that shares this repository."""
+        return self.git("worktree", "add", "-b", branch, path, revision, write=True, title="Create worktree", timeout=1800)
+
     def push(self, rev: str, target_branch: str, options: Sequence[str] = ()) -> str:
         refspec = f"{rev}:refs/for/{target_branch}"
         if options:

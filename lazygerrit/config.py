@@ -71,6 +71,7 @@ class Config:
     color_scheme: str = "auto"
     syntax_highlight: Any = "auto"  # "auto" (delta if installed), "off" or a command like delta --color-only
     merge_check_interval: int = 600  # seconds between looking up the branch on Gerrit for merge checks (0 = off)
+    worktree_dir: Optional[str] = None  # where new worktrees go (default: next to the repository)
     problems: list[str] = field(default_factory=list)
 
     @property

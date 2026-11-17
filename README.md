@@ -121,11 +121,19 @@ Actions apply to every selected change.
 | `y` | copy: number, URL, `N: subject \| URL`, markdown link, tower as markdown list, Change-Id, SHA, ref, fetch command… | `link`, `link_tower`, `change_number` |
 | `o` | open in the browser (change, file at line, job, comment) | |
 | `space` | check out locally with `git review -d` (refuses with a dirty tree) | |
+| `W` | check out the patch set in a new git worktree (see below) | |
 | `s` | custom Gerrit search in the Query tab | `list` |
 | `x` | menu with all of the above | |
 
 "Tower" means the selected change and all open changes below it, processed bottom-first, the same
 as rng's `*_tower` commands.
+
+**Worktrees**: `W` checks out the patch set you are looking at (normally the latest) in a new
+`git worktree`, so you can build or test a change without touching your current checkout. It asks
+for the path, which defaults to `<repository>-<change>` next to your repository (e.g.
+`~/git/src-704617`, or under `worktree_dir`), fetches the patch set and runs
+`git worktree add -b review/<change>-patch<N>`. Afterwards you can open a shell or your editor there.
+Remove it with `git worktree remove <path>` when you are done.
 
 Every write targets the change's *current* patch set, which is queried right before sending, just
 like rng. With several changes selected, they are processed bottom of the relation chain first.
@@ -276,6 +284,7 @@ state_file = "~/.local/state/lazygerrit/state.json"   # drafts and reviewed mark
 color_scheme = "auto"        # dark/light background, for {{colorScheme}} in diff_renderers
 syntax_highlight = "auto"    # review view: delta --color-only if delta is installed; "off"; or a command
 merge_check_interval = 600   # seconds between looking up the branch on Gerrit for merge checks (0 = off)
+worktree_dir = "~/git"       # where W creates worktrees (default: next to the repository)
 
 [[diff_renderers]]           # optional diff tools, see "Diff tools" above
 command = "delta --paging=never"

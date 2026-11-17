@@ -1,5 +1,7 @@
 import dataclasses
+import os
 import shlex
+import subprocess
 import sys
 import tempfile
 import threading
@@ -764,6 +766,52 @@ class BlameTest(AppTestCase):
         self.assertTrue(self.line(10).endswith("• Initial import"))  # return data[start:end]
 
 
+class WorktreeTest(AppTestCase):
+    def git(self, *args, cwd=None):
+        cmd = ["git", "-C", str(cwd or self.cfg.repo), *args]
+        return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+
+    def prompt_path(self):
+        self.assertIsInstance(self.app.popups[-1], PromptPopup)
+        return Path(os.path.expanduser(self.app.popups[-1].buf.text))
+
+    def test_check_out_a_patch_set_in_a_new_worktree(self):
+        self.select_change(100101)
+        self.press("W")
+        path = self.prompt_path()
+        self.assertEqual(path, Path(self.cfg.repo).parent / "demo-100101")
+        self.press("<enter>")
+        menu = self.app.popups[-1]
+        self.assertIsInstance(menu, MenuPopup)
+        self.assertIn("Worktree for 100101,2 (branch review/100101-patch2)", menu.title)
+        ps2 = self.server.changes[100101]["_patchsets"][1]["revision"]
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=path), ps2)
+        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD", cwd=path), "review/100101-patch2")
+        self.assertTrue((path / "stringent/rapid/crop.py").exists())
+        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD"), "review/100103")
+        with mock.patch("subprocess.call") as call, mock.patch("builtins.print"):
+            self.press("s")
+        self.assertEqual(call.call_args.kwargs["cwd"], str(path))
+
+    def test_another_worktree_of_the_same_change_gets_its_own_path_and_branch(self):
+        self.select_change(100101)
+        self.press("W", "<enter>", "<esc>", "W")
+        self.assertEqual(self.prompt_path().name, "demo-100101-ps2")
+        self.press("<enter>")
+        self.assertIn("(branch review/100101-patch2-2)", self.app.popups[-1].title)
+
+    def test_an_existing_directory_is_refused(self):
+        taken = Path(self.cfg.repo).parent / "taken"
+        taken.mkdir()
+        (taken / "file").write_text("x")
+        self.select_change(100101)
+        self.press("W", "<c-u>")
+        self.type(str(taken))
+        self.press("<enter>")
+        self.assertIsInstance(self.app.popups[-1], MessagePopup)
+        self.assertIn("already exists", self.app.popups[-1].message)
+
+
 class DryRunAppTest(AppTestCase):
     dry_run = True
 
@@ -774,6 +822,12 @@ class DryRunAppTest(AppTestCase):
         self.press("<enter>", "p", "<enter>")
         self.assertEqual(self.writes(), [])
         self.assertEqual([d.message for d in self.app.state.drafts_for(100101)], ["kept"])
+
+    def test_dry_run_creates_no_worktree(self):
+        self.select_change(100101)
+        self.press("W", "<enter>")
+        self.assertFalse((Path(self.cfg.repo).parent / "demo-100101").exists())
+        self.assertIn("Dry run: the worktree", self.app.toast[0])
 
     def test_dry_run_logs_instead_of_sending(self):
         self.select_change(100102)

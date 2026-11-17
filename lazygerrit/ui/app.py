@@ -15,6 +15,7 @@ import traceback
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
 from .. import __version__
@@ -75,6 +76,12 @@ class Binding:
     label: Optional[str] = None
     bar: Any = None
     bar_key: Optional[str] = None
+
+
+def tilde(path: str) -> str:
+    """``path`` with the home directory written as ~."""
+    home = str(Path.home())
+    return "~" + path[len(home) :] if path == home or path.startswith(home + os.sep) else path
 
 
 class App(ReviewMixin):
@@ -1630,6 +1637,7 @@ class App(ReviewMixin):
         # changes
         bind("changes", "<enter>", "Show files", self.act_enter_change)
         bind("changes", "<space>", "Check out change locally (git review -d)", self.act_checkout)
+        bind("change", "W", "Check out the patch set in a new git worktree…", self.act_worktree)
         bind("changes", "s", "Search (custom Gerrit query)", self.act_query, show="Search")
 
         # stack
@@ -2158,6 +2166,12 @@ class App(ReviewMixin):
                 disabled="Change is merged" if ch.is_merged else None,
             ),
             MenuItem("Check out locally", self.act_checkout, key="<space>", description=f"git review -d {ch.number}"),
+            MenuItem(
+                "Check out in a new worktree…",
+                self.act_worktree,
+                key="W",
+                description="git worktree add, next to your repository",
+            ),
             MenuItem("Copy…", self.act_copy_menu, key="y"),
             MenuItem("Open in browser", self.act_open, key="o"),
         ]
@@ -2681,6 +2695,98 @@ class App(ReviewMixin):
             f"Runs: git review -d {ch.number},<current patch set>",
             lambda: self.run_op(f"Checkout {ch.number}", work, reload_stack=True, after=done),
         )
+
+    # ------------------------------------------------------------------ worktrees
+
+    def act_worktree(self) -> None:
+        """Check out the viewed patch set (normally the latest) in a new git worktree."""
+        ts = self.need_targets(single=True)
+        if not ts:
+            return
+        ch = ts[0]
+        if not self.be.git.available or self.cfg.repo is None:
+            self.error("No local repository to create a worktree from (use --repo PATH).")
+            return
+        view = self.viewed_ps(ch)
+        if view is None or not view.revision:
+            self.show_toast("The change is still loading, try again in a moment", error=True)
+            return
+        latest = view.number == ch.ps
+
+        def submit(text: str) -> None:
+            if not text.strip():
+                return
+            path = os.path.abspath(os.path.expanduser(text.strip()))
+            if os.path.exists(path) and (not os.path.isdir(path) or os.listdir(path)):
+                self.error(f"{tilde(path)} already exists. Choose another path.", "New worktree")
+                return
+            self._create_worktree(ch, view, latest, path)
+
+        self.prompt(
+            f"New worktree for {ch.number},{'latest' if latest else view.number}: {ch.subject}",
+            submit,
+            initial=tilde(self.default_worktree_path(ch.number, view.number)),
+            hint=f"git worktree add with a new branch review/{ch.number}-patch<N>. Your current checkout is not touched.",
+        )
+
+    def default_worktree_path(self, number: int, psn: int) -> str:
+        """``<repo>-<change>`` next to the repository (or in worktree_dir), made unique."""
+        assert self.cfg.repo is not None
+        base = Path(self.cfg.worktree_dir).expanduser() if self.cfg.worktree_dir else self.cfg.repo.parent
+        name = f"{self.cfg.repo.name}-{number}"
+        for candidate in [name, f"{name}-ps{psn}"] + [f"{name}-ps{psn}-{i}" for i in range(2, 100)]:
+            if not (base / candidate).exists():
+                return str(base / candidate)
+        return str(base / name)
+
+    def _create_worktree(self, ch: Change, view: Any, latest: bool, path: str) -> None:
+        git, n = self.be.git, ch.number
+
+        def work() -> Optional[tuple[str, int]]:
+            ps = view
+            if latest:  # a newer patch set may have been uploaded since the change was loaded
+                fresh = self.be.light(n)
+                if fresh is not None and fresh.current is not None and fresh.current.revision:
+                    ps = fresh.current
+            git.ensure_commit(ps.revision, ps.ref)
+            branch, i = f"review/{n}-patch{ps.number}", 2
+            while git.branch_exists(branch):
+                branch, i = f"review/{n}-patch{ps.number}-{i}", i + 1
+            git.add_worktree(path, ps.revision, branch)
+            return None if self.cfg.dry_run else (branch, ps.number)
+
+        def done(result: Optional[tuple[str, int]]) -> None:
+            if result is None:
+                self.show_toast(f"Dry run: the worktree at {tilde(path)} was not created")
+                return
+            branch, psn = result
+            self.worktree_menu(path, f"Worktree for {n},{psn} (branch {branch})")
+
+        def failed(e: BaseException) -> None:
+            self.error(self.error_text(e), "Creating the worktree failed")
+
+        self.submit(f"worktree:{path}", work, done, failed, label=f"Creating worktree for {n}")
+
+    def worktree_menu(self, path: str, title: str) -> None:
+        items = [
+            MenuItem("Open a shell there", lambda: self.shell_in(path), key="s", description="exit the shell to come back"),
+            MenuItem("Open it in your editor", lambda: self.edit_in(path), key="e", description=self.cfg.editor()),
+            MenuItem("Copy the path", lambda: self.copy(path, "worktree path"), key="y", description=tilde(path)),
+        ]
+        self.menu(f"{title} is at {tilde(path)}", items)
+
+    def shell_in(self, path: str) -> None:
+        shell = os.environ.get("SHELL") or "/bin/sh"
+
+        def run() -> None:
+            print(f"lazygerrit: a shell in {path} (exit it to return to lazygerrit)", flush=True)
+            subprocess.call([shell], cwd=path)
+
+        self.suspend_hook(run)
+
+    def edit_in(self, path: str) -> None:
+        cmd = editor_command(self.cfg.editor(), path)
+        self.suspend_hook(lambda: subprocess.call(cmd, cwd=path))
 
     def act_copy_menu(self) -> None:
         ts = self.need_targets()
