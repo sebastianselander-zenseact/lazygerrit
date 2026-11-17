@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from .. import operations as ops
 from ..diff import LineRef, file_as_added, parse_unified, unified_text_diff
 from ..drafts import Draft
-from ..models import COMMIT_MSG, PATCHSET_LEVEL, Change, FileInfo, PatchSet, Thread
+from ..models import COMMIT_MSG, PATCHSET_LEVEL, Change, FileInfo, HistoryCommit, PatchSet, Thread
 from ..renderers import BUILTIN, DiffRenderer, run_highlighter
 from ..renderers import render as render_with
 from . import render, theme
@@ -23,6 +23,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from .app import App
 
 FULL_FILE_CONTEXT = 1_000_000
+HISTORY_LIMIT = 20  # commits shown in the line history
 CODE_REVIEW = ("Code-Review", [-2, -1, 0, 1, 2])
 SECONDARY_REVIEW = ("Secondary-Review", [-1, 0, 1])
 
@@ -339,6 +340,7 @@ class ReviewMixin:
             base_ps=base_n or None,
             notes=notes,
             styled=self.diff_styles.get(key),
+            blame=self._blame_notes(key, rows) if self.blame_on else None,
         )
         title = self._diff_title(key)
         first = self.rendered_diff != key
@@ -387,6 +389,213 @@ class ReviewMixin:
     def _rerender_diff(self: "App") -> None:
         if self.main_key and self.main_key[0] == "diff" and self.main_diff:
             self._render_diff(self.main_key)
+
+    # ------------------------------------------------------------------ blame
+
+    def act_toggle_blame(self: "App") -> None:
+        """Show or hide, for every line, who last changed it, when and in which commit (like VS Code)."""
+        if self.showing_rendered_diff():  # blame is part of the review view
+            self.blame_on = True
+            self.open_review_view()
+            return
+        self.blame_on = not self.blame_on
+        self.show_toast("Blame on (b hides it, enter shows a line's history)" if self.blame_on else "Blame off")
+        if self.main_key and self.main_key[0] == "diff":
+            self._render_diff(self.main_key)
+
+    def _blame_notes(self: "App", key: tuple, rows: list) -> dict[int, str]:
+        """The blame note of every code row of the diff ``key`` that has been blamed so far."""
+        _, n, view_n, base_n, path, _full, old_path = key
+        ch = self.change(n)
+        view = self._patchset(ch, view_n) if ch else None
+        if ch is None or view is None or not view.revision or path == COMMIT_MSG or path.startswith("/"):
+            return {}
+        if base_n:  # the left side is the older patch set
+            base = self._patchset(ch, base_n)
+            old_rev = base.revision if base else ""
+        else:
+            old_rev = view.parents[0] if view.parents else f"{view.revision}^"
+        new_side, old_side = (view.revision, path), (old_rev, old_path or path)
+        self._need_blame(new_side, [r.new for r in rows if r.kind in ("add", "ctx") and r.new])
+        if old_rev:
+            self._need_blame(old_side, [r.old for r in rows if r.kind == "del" and r.old])
+        known = self.known_revisions(n)
+        notes: dict[int, str] = {}
+        for i, r in enumerate(rows):
+            if r.kind in ("add", "ctx") and r.new:
+                sha = self.blame_lines.get(new_side, {}).get(r.new)
+            elif r.kind == "del" and r.old:
+                sha = self.blame_lines.get(old_side, {}).get(r.old)
+            else:
+                continue
+            commit = self.blame_commits.get(sha) if sha else None
+            if commit is None:
+                continue
+            who = "You" if self.git_email and commit.mail.lower() == self.git_email else commit.author
+            what = commit.summary
+            if sha in known:
+                number, _ = known[sha]
+                what = "this change" if number == n else f"change {number}: {commit.summary}"
+            notes[i] = f"{who}, {render.rel_ago(commit.time)} • {what}"
+        return notes
+
+    def _need_blame(self: "App", side: tuple[str, str], lines: list[int]) -> None:
+        """Blame ``lines`` of (revision, path) in the background unless that was done already."""
+        tried = self.blame_tried.setdefault(side, set())
+        missing = sorted(set(lines) - tried)
+        rev, path = side
+        task = f"blame:{rev}:{path}"
+        if not missing or task in self.inflight or not self.be.git.available:
+            return
+        tried.update(missing)
+        git = self.be.git
+
+        def work() -> tuple[tuple[dict[int, str], dict[str, Any]], str]:
+            return git.blame(rev, path, missing), git.user_email()
+
+        def done(result: tuple[tuple[dict[int, str], dict[str, Any]], str]) -> None:
+            (lines_found, commits), self.git_email = result
+            self.blame_lines.setdefault(side, {}).update(lines_found)
+            self.blame_commits.update(commits)
+            if self.blame_on and self.main_key and self.main_key[0] == "diff":
+                self._render_diff(self.main_key)
+
+        def failed(e: BaseException) -> None:
+            if not self.blame_warned:
+                self.blame_warned = True
+                self.show_toast(f"Blame failed: {self.error_text(e).splitlines()[0]}", error=True)
+
+        self.submit(task, work, done, failed)
+
+    # ------------------------------------------------------------------ line history
+
+    def act_line_history(self: "App") -> None:
+        """Who changed the line (or v-selected lines) under the cursor and why: git log -L."""
+        self._snap_to_code()
+        sel = self._line_selection()
+        ch = self.change(self.main_diff[0]) if self.main_diff else None
+        if sel is None or ch is None:
+            self.error("Put the cursor on a line of code to see its history.", "Line history")
+            return
+        ref, rng = sel
+        ps = self._patchset(ch, ref.patch_set)
+        if ps is None or not ps.revision or ref.line <= 0 or ref.path == COMMIT_MSG or ref.path.startswith("/"):
+            self.error("Line history is available for lines of files (not the commit message).", "Line history")
+            return
+        if not self.be.git.available:
+            self.error("Line history needs a local clone of the repository (start lazygerrit inside it).", "Line history")
+            return
+        # Removed lines are in the patch set's parent; everything else in the patch set itself.
+        rev = (ps.parents[0] if ps.parents else f"{ps.revision}^") if ref.side == "PARENT" else ps.revision
+        start, end = (rng["start_line"], rng["end_line"]) if rng else (ref.line, ref.line)
+        key = ("history", ch.number, rev, ref.path, start, end, ps.number, ref.side == "PARENT")
+        self.history_back = (self.main_key, self.p_main.cursor, self.p_main.scroll)
+        self.p_main.anchor = None
+        if key in self.history_cache:
+            self._show_history(key)
+            return
+        self.set_main(
+            key, self._history_title(key), [[("Loading the history of these lines (git log -L)…", theme.DIM)]], wrap=False
+        )
+        git, path = self.be.git, ref.path
+
+        def done(commits: list[HistoryCommit]) -> None:
+            self.history_cache[key] = commits
+            if self.main_key == key:
+                self._show_history(key)
+
+        def failed(e: BaseException) -> None:
+            if self.main_key == key:
+                lines = [[("Could not get the history:", theme.BAD)]] + text_block(self.error_text(e), theme.BAD)
+                self.set_main(key, self._history_title(key), lines, wrap=False)
+
+        self.submit(
+            f"history:{key}", lambda: git.line_history(rev, path, start, end, HISTORY_LIMIT), done, failed, label="Line history"
+        )
+
+    @staticmethod
+    def _history_where(key: tuple) -> str:
+        _, _, _, path, start, end, _, _ = key
+        return f"{path}:{start}" + (f"-{end}" if end != start else "")
+
+    def _history_title(self: "App", key: tuple) -> str:
+        return f"History · {self._history_where(key)}"
+
+    def _show_history(self: "App", key: tuple) -> None:
+        _, n, _, _, _, _, psn, parent = key
+        version = f"before patch set {psn}" if parent else f"in patch set {psn}"
+        labels = {
+            rev: (f"this change, patch set {k}" if num == n else f"change {num} patch set {k}")
+            for rev, (num, k) in self.known_revisions(n).items()
+        }
+        lines, meta = render.history_view(
+            self.history_cache[key],
+            heading=f"History of {self._history_where(key)} {version}",
+            labels=labels,
+            width=self.main_width,
+        )
+        self.set_main(key, self._history_title(key), lines, wrap=False, meta=meta, cursor_mode=True)
+        self.p_main.set_cursor(next((i for i, m in enumerate(meta) if m), 0))
+
+    def known_revisions(self: "App", n: int) -> dict[str, tuple[int, int]]:
+        """Commit -> (change, patch set) for every patch set lazygerrit knows; change ``n`` wins."""
+        out: dict[str, tuple[int, int]] = {}
+        changes = list(self.details.values()) + [c for chs in self.tab_data.values() for c in chs]
+        changes += [c.change for c in self.stack if c.change]
+        for c in sorted(changes, key=lambda c: c.number == n):
+            for ps in c.patch_sets or ([c.current] if c.current else []):
+                if ps.revision:
+                    out[ps.revision] = (c.number, ps.number)
+        return out
+
+    def _history_commit(self: "App") -> Optional[HistoryCommit]:
+        meta = self.p_main.cursor_meta()
+        return meta[1] if isinstance(meta, tuple) and meta and meta[0] == "commit" else None
+
+    def _history_target(self: "App", c: HistoryCommit) -> Optional[str]:
+        """How to find the commit's change on Gerrit: its number or Change-Id."""
+        known = self.known_revisions(0).get(c.sha)
+        if known:
+            return str(known[0])
+        if c.change_number:
+            return str(c.change_number)
+        return c.change_id
+
+    def act_history_back(self: "App") -> None:
+        back, self.history_back = self.history_back, None
+        if back is None or not self.main_diff:
+            self.focus_panel(self.last_side)
+            return
+        key, cursor, scroll = back
+        self._reshow_diff()
+        if self.main_key == key:
+            self.p_main.set_cursor(cursor)
+            self.p_main.scroll_to(scroll)
+
+    def act_history_change(self: "App") -> None:
+        c = self._history_commit()
+        if c is None:
+            return
+        target = self._history_target(c)
+        if target is None:
+            self.show_toast(f"{c.short} is not from a Gerrit change (no Change-Id)", error=True)
+            return
+        self.run_query(f"change:{target}")
+
+    def act_history_open(self: "App") -> None:
+        c = self._history_commit()
+        if c is None:
+            return
+        target = self._history_target(c)
+        if target and target.isdigit():
+            self.open(self.cfg.change_url(int(target)))
+        else:
+            self.open(f"{self.cfg.base_url}/q/{target or 'commit:' + c.sha}")
+
+    def act_history_copy(self: "App") -> None:
+        c = self._history_commit()
+        if c is not None:
+            self.copy(c.sha, "commit hash")
 
     # ------------------------------------------------------------------ diff renderers (delta, difftastic, …)
 
@@ -439,7 +648,11 @@ class ReviewMixin:
         if not rows:
             return "", 0.0
         i = max(0, min(self.p_main.cursor, len(rows) - 1))
-        text = render.diff_code_text(rows[i]) if isinstance(self.p_main.cursor_meta(), LineRef) else plain(rows[i])
+        meta = self.p_main.cursor_meta()
+        if isinstance(meta, LineRef):
+            text = meta.text or render.diff_code_text(rows[i])
+        else:
+            text = plain(rows[i])
         return text, i / max(1, len(rows) - 1)
 
     def _apply_map(self: "App", key: tuple, lines: list[Line], meta: Optional[list[Any]]) -> bool:

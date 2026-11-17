@@ -19,6 +19,7 @@ from ..models import (
     CIJob,
     CIReport,
     FileInfo,
+    HistoryCommit,
     LocalCommit,
     MergeInfo,
     Thread,
@@ -972,6 +973,7 @@ def synth_commit_msg(ch: Change, ps: Any, subjects: Optional[dict[str, str]] = N
 
 
 _TOKEN_RE = re.compile(r"\w+|\s+|[^\w\s]")
+BLAME = replace(theme.DIM, italic=True)
 ADD_EMPH = Style(fg=2, bg=22)
 DEL_EMPH = Style(fg=1, bg=52)
 
@@ -1088,10 +1090,12 @@ def diff_lines(
     base_ps: Optional[int] = None,
     notes: Sequence[Line] = (),
     styled: Optional[dict[int, tuple[Line, Optional[Style]]]] = None,
+    blame: Optional[dict[int, str]] = None,
 ) -> tuple[list[Line], list[Any]]:
     """Render diff rows with line numbers, intraline highlights, comment threads and drafts.
 
     ``styled`` (from highlight_rows) replaces the coloring of code lines, e.g. with syntax highlighting.
+    ``blame`` adds a note after code lines ({row index: text}), lined up where the lines allow it.
 
     ``threads`` belong to ``new_ps`` (REVISION side on the right, PARENT side on the left when the
     base is the parent commit); ``threads_old`` belong to ``base_ps`` and are shown on the left.
@@ -1177,6 +1181,8 @@ def diff_lines(
     texts = [sanitize(r.text) for r in rows]
     emph = _intraline_ranges(texts, rows)
     hunk_no = 0
+    code_w = max((nw * 2 + 3 + text_width(texts[i]) for i in (blame or {}) if i < len(texts)), default=0)
+    blame_col = min(code_w + 3, max(40, width * 3 // 5))
     for idx, r in enumerate(rows):
         text = texts[idx]
         if r.kind == "meta":
@@ -1198,18 +1204,25 @@ def diff_lines(
             if r.kind == "add":
                 body = hl[0] if hl else emphasize(text, emph.get(idx, []), theme.OK, ADD_EMPH)
                 ln = [gutter, ("+", replace(theme.OK, bg=fill.bg) if fill else theme.OK)] + body
-                meta.append(LineRef(path, r.new or 0, None, new_ps, len(text)))
+                meta.append(LineRef(path, r.new or 0, None, new_ps, len(text), text))
             elif r.kind == "del":
                 body = hl[0] if hl else emphasize(text, emph.get(idx, []), theme.BAD, DEL_EMPH)
                 ln = [gutter, ("-", replace(theme.BAD, bg=fill.bg) if fill else theme.BAD)] + body
                 if base_ps is not None:
                     # Left side of a patch set comparison: that file as it is in the older patch set.
-                    meta.append(LineRef(old_path or path, r.old or 0, None, base_ps, len(text)))
+                    meta.append(LineRef(old_path or path, r.old or 0, None, base_ps, len(text), text))
                 else:
-                    meta.append(LineRef(path, r.old or 0, "PARENT", new_ps, len(text)))
+                    meta.append(LineRef(path, r.old or 0, "PARENT", new_ps, len(text), text))
             else:
                 ln = [gutter, (" ", PLAIN)] + hl[0] if hl else [gutter, (" " + text, PLAIN)]
-                meta.append(LineRef(path, r.new or 0, None, new_ps, len(text)))
+                meta.append(LineRef(path, r.new or 0, None, new_ps, len(text), text))
+            note = blame.get(idx) if blame else None
+            if note:
+                used = line_width(ln)
+                pad = max(3, blame_col - used)
+                room = width - used - pad
+                ln.append((" " * pad, fill or PLAIN))
+                ln.append((truncate_str(note, room) if room >= 12 else note, replace(BLAME, bg=fill.bg) if fill else BLAME))
             if fill is not None and line_width(ln) < width:
                 ln.append((" " * (width - line_width(ln)), fill))  # like the terminal's erase-to-end-of-line
             out.append(ln)
@@ -1230,6 +1243,55 @@ def diff_lines(
     if not rows:
         out.append([("(no textual changes)", theme.DIM)])
         meta.append(None)
+    return out, meta
+
+
+def history_view(
+    commits: Sequence[HistoryCommit], *, heading: str, labels: dict[str, str], width: int
+) -> tuple[list[Line], list[Any]]:
+    """The line history view: one block per commit (meta ("commit", c)) with its message and the diff
+    of the lines. ``labels`` names commits that are patch sets lazygerrit knows ("this change", …)."""
+    out: list[Line] = []
+    meta: list[Any] = []
+
+    def add(line: Line, m: Any = None) -> None:
+        out.append(line)
+        meta.append(m)
+
+    add([(heading, theme.HEADING)])
+    add([("Newest first.  enter: show its change  ·  o: open it in the browser  ·  y: copy hash  ·  esc: back", theme.DIM)])
+    add([])
+    if not commits:
+        add([("No commits found for these lines.", theme.DIM)])
+    for c in commits:
+        m = ("commit", c)
+        head: Line = [("● ", theme.INFO), (c.short, theme.HASH), ("  ", PLAIN), (sanitize(c.subject), theme.BOLD)]
+        if c.sha in labels:
+            head.append((f"  ← {labels[c.sha]}", theme.MAGIC))
+        add(head, m)
+        info: Line = [
+            ("  ", PLAIN),
+            (sanitize(c.author), theme.author_style(c.author)),
+            (f" · {rel_ago(c.timestamp)}", theme.DIM),
+        ]
+        if c.change_number and c.sha not in labels:
+            info += [(" · change ", theme.DIM), (str(c.change_number), theme.NUMBER)]
+        if c.created:
+            info.append((" · added the file", theme.DIM))
+        add(info, m)
+        body = c.body
+        if body:
+            add([], m)
+            for raw in body:
+                for part in wrap(sanitize(raw), max(20, width - 4)) or [""]:
+                    add([("    ", PLAIN), (part, PLAIN)], m)
+        add([], m)
+        for d in c.diff:
+            style = (
+                theme.INFO if d.startswith("@@") else theme.OK if d.startswith("+") else theme.BAD if d.startswith("-") else PLAIN
+            )
+            add([("    ", PLAIN), (sanitize(d), style)], m)
+        add([])
     return out, meta
 
 
@@ -1257,7 +1319,7 @@ def map_row(probe: tuple[str, float], lines: Sequence[Line], meta: Optional[Sequ
         if meta is not None:
             if i >= len(meta) or not isinstance(meta[i], LineRef):
                 continue
-            code = " ".join(diff_code_text(ln).split())
+            code = " ".join((meta[i].text or diff_code_text(ln)).split())
             hit = len(code) >= 4 and code in want
             score = (not hit, -len(code) if hit else 0, pos)
         else:

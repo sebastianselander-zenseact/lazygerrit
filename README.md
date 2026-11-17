@@ -184,6 +184,8 @@ unreadable state file is moved aside to `state.json.corrupt-<time>` instead of b
 | `D` | delete the draft under the cursor |
 | `space` | mark the file reviewed and go to the next one |
 | `z` | toggle whole-file view |
+| `b` | blame on/off: after every line, who last changed it, when and in which commit, like VS Code's inline blame. Lines added by the change itself say "this change" |
+| `enter` | line history: the commits that changed the line (or the `v`-selected lines) and why (`git log -L`). There, `enter` shows a commit's change, `o` opens it in the browser, `y` copies the hash, `esc` goes back |
 | `\|` | switch the diff view: review view, delta, difftastic, … (see [Diff tools](#diff-tools-delta-difftastic-)) |
 | `P` / `B` | patch set / base to compare against |
 | `p` | publish drafts with a vote and message |
@@ -306,7 +308,7 @@ checks add a `git ls-remote` every `merge_check_interval` seconds, plus a fetch 
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests -t .   # 120+ tests, no network needed
+python3 -m unittest discover -s tests -t .   # 130+ tests, no network needed
 ./bin/lazygerrit --demo                       # play with the UI offline
 ruff check lazygerrit tests
 ```

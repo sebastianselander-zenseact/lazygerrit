@@ -158,6 +158,60 @@ class Thread:
         return f"{name}:{self.line}" if self.line else name
 
 
+_REVIEWED_ON_RE = re.compile(r"^Reviewed-on:\s*\S*/\+/(\d+)\s*$", re.M)
+_CHANGE_ID_RE = re.compile(r"^Change-Id:\s*(I[0-9a-f]{40})\s*$", re.M)
+# Trailers Gerrit adds when it merges a change; noise when reading a commit's message.
+GERRIT_TRAILER_RE = re.compile(r"^(Change-Id|Reviewed-on|Reviewed-by|Tested-by):", re.I)
+
+
+@dataclass
+class BlameCommit:
+    """The commit git blame names for some lines."""
+
+    sha: str
+    author: str
+    mail: str
+    time: int
+    summary: str
+
+
+@dataclass
+class HistoryCommit:
+    """A commit in the history of some lines of a file (git log -L)."""
+
+    sha: str
+    short: str
+    author: str
+    timestamp: int
+    message: str
+    diff: list[str] = field(default_factory=list)  # the hunks of those lines: "@@ …", "+…", "-…", " …"
+    created: bool = False  # the commit added the file
+
+    @property
+    def subject(self) -> str:
+        return self.message.split("\n", 1)[0]
+
+    @property
+    def body(self) -> list[str]:
+        lines = [ln for ln in self.message.split("\n")[1:] if not GERRIT_TRAILER_RE.match(ln)]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return lines
+
+    @property
+    def change_number(self) -> Optional[int]:
+        """The Gerrit change it was merged from (its Reviewed-on trailer)."""
+        m = _REVIEWED_ON_RE.search(self.message)
+        return int(m.group(1)) if m else None
+
+    @property
+    def change_id(self) -> Optional[str]:
+        m = _CHANGE_ID_RE.search(self.message)
+        return m.group(1) if m else None
+
+
 @dataclass
 class MergeInfo:
     """Whether a change's current patch set can be merged into its branch (Gerrit's "Merge Conflict").

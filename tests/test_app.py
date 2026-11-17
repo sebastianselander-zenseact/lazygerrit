@@ -532,6 +532,13 @@ class DiffRendererTest(AppTestCase):
         self.assertEqual(self.app.focus, "files")
         self.assertTrue(self.app.p_main.title.endswith("· marker"))
 
+    def test_blame_switches_to_the_review_view(self):
+        self.open_diff(100101)
+        self.press("b")
+        self.assertNotIn("marker", self.app.p_main.title)
+        self.assertTrue(self.app.blame_on)
+        self.assertTrue(any(" • " in plain(ln) for ln in self.app.p_main.lines))
+
     def test_commit_message_and_jumping_to_comments(self):
         self.open_diff(100101, file_index=0)
         self.assertIn("» +Add DLT log cropping", self.main_text())
@@ -671,6 +678,90 @@ class MergeConflictTest(AppTestCase):
         self.assertIn("CONFLICT Refactor zuul dispatcher docs", self.row(100201))
         self.assertIn("Zuul could not merge patch set 1", self.screen())
         self.assertIn("rebase it and upload a new patch set", self.screen())
+
+
+class LineHistoryTest(AppTestCase):
+    def text(self):
+        return [plain(ln) for ln in self.app.p_main.lines]
+
+    def commits(self):
+        return [t for t in self.text() if t.startswith("● ")]
+
+    def test_history_of_a_line_and_back(self):
+        self.open_diff(100101)
+        self.cursor_to(9)
+        cursor = self.app.p_main.cursor
+        self.press("<enter>")
+        text = self.text()
+        self.assertEqual(text[0], "History of stringent/rapid/crop.py:9 in patch set 2")
+        commits = self.commits()
+        self.assertEqual(len(commits), 2)
+        self.assertTrue(commits[0].endswith("Add DLT log cropping  ← this change, patch set 2"))
+        self.assertTrue(commits[1].endswith("Initial import"))
+        self.assertIn("    Crops the DLT header and footer.", text)
+        self.assertIn("    +        data = fh.read()", text)
+        self.assertFalse(any("Change-Id" in t for t in text))
+        self.press("<esc>")
+        self.assertEqual(self.app.main_key[0], "diff")
+        self.assertEqual((self.app.p_main.cursor, self.app.p_main.cursor_meta().line), (cursor, 9))
+
+    def test_removed_lines_ranges_and_jumping_to_the_change(self):
+        self.open_diff(100101)
+        self.cursor_to(7, "PARENT")
+        self.press("<enter>")
+        self.assertEqual(self.text()[0], "History of stringent/rapid/crop.py:7 before patch set 2")
+        self.assertEqual(len(self.commits()), 1)
+        self.press("<esc>")
+        self.cursor_to(7)
+        self.press("v", "j", "j", "<enter>")
+        self.assertEqual(self.text()[0], "History of stringent/rapid/crop.py:7-9 in patch set 2")
+        self.press("<enter>")
+        self.assertEqual(self.app.focus, "changes")
+        self.assertEqual(self.app.custom_query, "change:100101")
+        self.assertEqual([c.number for c in self.app.p_changes.view()], [100101])
+
+    def test_commits_without_a_change_and_the_commit_message(self):
+        self.open_diff(100101)
+        self.cursor_to(7, "PARENT")
+        self.press("<enter>", "<enter>")
+        self.assertIn("is not from a Gerrit change", self.app.toast[0])
+        self.press("<esc>", ",", "j", "<enter>")
+        self.assertIsInstance(self.app.popups[-1], MessagePopup)
+        self.assertIn("not the commit message", self.app.popups[-1].message)
+
+
+class BlameTest(AppTestCase):
+    def line(self, number, side=None):
+        meta = self.app.p_main.meta
+        return plain(
+            self.app.p_main.lines[
+                next(i for i, m in enumerate(meta) if isinstance(m, LineRef) and (m.line, m.side) == (number, side))
+            ]
+        )
+
+    def code_lines(self):
+        return [plain(ln) for ln, m in zip(self.app.p_main.lines, self.app.p_main.meta, strict=True) if isinstance(m, LineRef)]
+
+    def test_blame_shows_for_all_lines_or_none(self):
+        self.open_diff(100101)
+        self.assertFalse(any("•" in t for t in self.code_lines()))
+        self.press("b")
+        self.assertRegex(self.line(9), r"^ +9 \+        data = fh\.read\(\) +You, .* • this change$")
+        self.assertRegex(self.line(6), r"def crop\(path, start, end\): +You, .* • Initial import$")
+        self.assertRegex(self.line(7, "PARENT"), r"-    data = open\(path\)\.read\(\) +You, .* • Initial import$")
+        self.assertTrue(all(" • " in t for t in self.code_lines()))
+        self.cursor_to(9)
+        self.assertEqual(self.app._cursor_probe()[0], "        data = fh.read()")
+        self.press(",", ".")  # to the commit message and back: blame stays on for every diff
+        self.assertTrue(all(" • " in t for t in self.code_lines()))
+        self.press("b")
+        self.assertFalse(any("•" in t for t in self.code_lines()))
+
+    def test_blame_when_comparing_patch_sets(self):
+        self.select_change(100101)
+        self.press("4", "B", "1", "j", "<enter>", "b")
+        self.assertTrue(self.line(13).endswith("• this change"))  # +def crop_dlt(path):
+        self.assertTrue(self.line(10).endswith("• Initial import"))  # return data[start:end]
 
 
 class DryRunAppTest(AppTestCase):

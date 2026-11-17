@@ -198,6 +198,14 @@ class App(ReviewMixin):
         self.merge_checked: dict[tuple[str, str], list[str]] = {}  # (tip, revision) -> conflicting files
         self.merge_latest: dict[str, list[str]] = {}  # revision -> conflicting files at the newest tip checked
         self.merge_pending: set[str] = set()
+        self.history_cache: dict[tuple, list[Any]] = {}
+        self.blame_on = False  # b: who last changed each line, for all lines of every diff
+        self.blame_lines: dict[tuple[str, str], dict[int, str]] = {}  # (revision, path) -> {line: commit}
+        self.blame_tried: dict[tuple[str, str], set[int]] = {}
+        self.blame_commits: dict[str, Any] = {}
+        self.blame_warned = False
+        self.git_email = ""
+        self.history_back: Optional[tuple[Any, int, int]] = None  # the diff (key, cursor, scroll) to return to
         self.syntax_command = syntax_command(cfg.syntax_highlight)
         self.diff_styles: dict[tuple, dict[int, Any]] = {}
         self.syntax_warned = False
@@ -1438,8 +1446,10 @@ class App(ReviewMixin):
         f = self.focus
         if f == "main":
             kind = self.main_key[0] if self.main_key else ""
-            # Also while a diff is loading or failed, so | and ./, still work.
-            mode = "diff" if self.p_main.cursor_mode or kind == "diff" else (kind if kind in ("thread", "draft") else "text")
+            if kind in ("thread", "draft", "history"):
+                mode = kind
+            else:  # diffs, also while loading or failed, so | and ./, still work
+                mode = "diff" if self.p_main.cursor_mode or kind == "diff" else "text"
             return [f"main:{mode}", "main", "global"]
         if f == "cmdlog":
             return ["main", "global"]
@@ -1708,6 +1718,12 @@ class App(ReviewMixin):
         bind("main:diff", "[", "Previous hunk", rv(lambda: self.diff_jump_hunk(-1)))
         bind("main:diff", "}", "Next comment", rv(lambda: self.diff_jump_comment(1)), show="Thread", bar_key="}/{")
         bind("main:diff", "{", "Previous comment", rv(lambda: self.diff_jump_comment(-1)))
+        bind("main:diff", "b", "Blame: who last changed each line (toggle)", self.act_toggle_blame, show="Blame")
+        bind("main:diff", "<enter>", "Line history: the commits that changed this line (git log -L)", rv(self.act_line_history))
+        bind("main:history", "<enter>", "Show the commit's change", self.act_history_change, show="Show change")
+        bind("main:history", "o", "Open the commit's change in the browser", self.act_history_open, show="Open")
+        bind("main:history", "y", "Copy the commit hash", self.act_history_copy, show="Copy hash")
+        bind("main:history", "<esc>", "Back to the diff", self.act_history_back, show="Back")
         cycle = "Switch the diff view (review view, delta, difftastic, …)"
         bind("main:diff", "|", cycle, self.act_cycle_renderer, show="Diff view" if len(self.renderers) > 1 else False)
         bind("main:diff", ".", "Next file", lambda: self.diff_next_file(1), show="File", bar_key="./,")
@@ -2803,23 +2819,24 @@ class App(ReviewMixin):
             return
         self.open(self.cfg.change_url(ch.number, ch.project))
 
-    def act_query(self) -> None:
-        def submit(text: str) -> None:
-            self.custom_query = text.strip()
-            self.custom_query_set = True
-            idx = self.query_tab_index()
-            self.tab_loaded.pop(idx, None)
-            self.tab_data.pop(idx, None)
-            if self.p_changes.tab != idx:
-                self.set_tab(self.p_changes, idx)
-            else:
-                self.load_tab(idx)
-                self.refresh_changes_panel()
-            self.focus_panel("changes")
+    def run_query(self, text: str) -> None:
+        """Show the results of a Gerrit search in the Query tab."""
+        self.custom_query = text.strip()
+        self.custom_query_set = True
+        idx = self.query_tab_index()
+        self.tab_loaded.pop(idx, None)
+        self.tab_data.pop(idx, None)
+        if self.p_changes.tab != idx:
+            self.set_tab(self.p_changes, idx)
+        else:
+            self.load_tab(idx)
+            self.refresh_changes_panel()
+        self.focus_panel("changes")
 
+    def act_query(self) -> None:
         self.prompt(
             "Gerrit search",
-            submit,
+            self.run_query,
             initial=self.custom_query,
             hint="Any Gerrit query, e.g. 'status:open project:src topic:foo' or 'reviewer:self -is:reviewed'",
         )

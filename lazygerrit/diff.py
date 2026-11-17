@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
@@ -31,6 +31,7 @@ class LineRef:
     side: Optional[str] = None
     patch_set: int = 0
     length: int = 0
+    text: str = field(default="", compare=False, repr=False)  # the code, to find the line in another view
 
     @property
     def anchor(self) -> tuple[str, int, Optional[str], int]:

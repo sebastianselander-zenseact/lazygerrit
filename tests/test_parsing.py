@@ -195,6 +195,44 @@ class ZuulParsingTest(unittest.TestCase):
         self.assertEqual(jobs[0].stream_url, "https://zuul.example.com/t/src/stream/u1?logfile=console.log")
 
 
+class LineHistoryParsingTest(unittest.TestCase):
+    def test_git_log_l_output(self):
+        from lazygerrit.localgit import parse_line_history
+
+        out = (
+            "\x1eaaa111\x1faaa\x1fKim\x1f1700000000\x1fFix it\n\nBecause.\n\nChange-Id: I" + "1" * 40 + "\n"
+            "Reviewed-on: https://gerrit.example.com/c/src/+/12345\nReviewed-by: Sam <s@x>\n\x1f\n\n"
+            "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -3,1 +3,1 @@\n-old\n+new\n\n"
+            "\x1ebbb222\x1fbbb\x1fSam\x1f1600000000\x1fAdd f\n\x1f\n\n"
+            "diff --git a/f.py b/f.py\n--- /dev/null\n+++ b/f.py\n@@ -0,0 +3,1 @@\n+old\n"
+        )
+        fix, add = parse_line_history(out)
+        self.assertEqual((fix.short, fix.subject, fix.change_number, fix.change_id), ("aaa", "Fix it", 12345, "I" + "1" * 40))
+        self.assertEqual(fix.body, ["Because."])
+        self.assertEqual(fix.diff, ["@@ -3,1 +3,1 @@", "-old", "+new"])
+        self.assertEqual((add.created, add.change_number, add.change_id, add.timestamp), (True, None, None, 1600000000))
+
+
+class BlameParsingTest(unittest.TestCase):
+    def test_porcelain(self):
+        from lazygerrit.localgit import line_ranges, parse_blame
+
+        a, b = "a" * 40, "b" * 40
+        out = (
+            f"{a} 1 7 2\nauthor Kim\nauthor-mail <kim@x>\nauthor-time 1700000000\nauthor-tz +0100\n"
+            "summary Fix it\nprevious 0123 f.py\nfilename f.py\n\tfirst\n"
+            f"{a} 2 8\n\tsecond\n"
+            f"{b} 5 12 1\nauthor Sam\nauthor-mail <sam@x>\nauthor-time 1600000000\nsummary Add f\nboundary\nfilename f.py\n\tthird\n"
+        )
+        lines, commits = parse_blame(out)
+        self.assertEqual(lines, {7: a, 8: a, 12: b})
+        self.assertEqual(
+            (commits[a].author, commits[a].mail, commits[a].time, commits[a].summary), ("Kim", "kim@x", 1700000000, "Fix it")
+        )
+        self.assertEqual(commits[b].summary, "Add f")
+        self.assertEqual(line_ranges([8, 7, 12, 9, 13, 20]), [(7, 9), (12, 13), (20, 20)])
+
+
 class ThreadTest(unittest.TestCase):
     def test_rest_threads_follow_latest_comment(self):
         data = {

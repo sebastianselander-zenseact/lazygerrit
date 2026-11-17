@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
 import shlex
 import shutil
 import tempfile
@@ -11,7 +12,68 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from .gerrit import CommandError, Runner, runtime_dir
-from .models import FileInfo, LocalCommit
+from .models import BlameCommit, FileInfo, HistoryCommit, LocalCommit
+
+HISTORY_FORMAT = "%x1e%H%x1f%h%x1f%an%x1f%at%x1f%B%x1f"
+_BLAME_LINE_RE = re.compile(r"^([0-9a-f]{40}) \d+ (\d+)(?: \d+)?$")
+
+
+def parse_blame(text: str) -> tuple[dict[int, str], dict[str, BlameCommit]]:
+    """Parse ``git blame --porcelain``: ({line: commit}, {commit: details})."""
+    lines: dict[int, str] = {}
+    commits: dict[str, BlameCommit] = {}
+    sha: Optional[str] = None
+    info: dict[str, str] = {}
+    for raw in text.split("\n"):
+        if sha is None:
+            m = _BLAME_LINE_RE.match(raw)
+            if m:
+                sha, info = m.group(1), {}
+                lines[int(m.group(2))] = sha
+            continue
+        if raw.startswith("\t"):  # the line's content ends its entry
+            if sha not in commits and "author" in info:
+                time = info.get("author-time", "")
+                mail = info.get("author-mail", "").strip("<>")
+                commits[sha] = BlameCommit(sha, info["author"], mail, int(time) if time.isdigit() else 0, info.get("summary", ""))
+            sha = None
+            continue
+        key, _, value = raw.partition(" ")
+        info[key] = value
+    return lines, commits
+
+
+def line_ranges(lines: Sequence[int]) -> list[tuple[int, int]]:
+    """[1, 2, 3, 7, 8] -> [(1, 3), (7, 8)]"""
+    out: list[tuple[int, int]] = []
+    for n in sorted(set(lines)):
+        if out and n == out[-1][1] + 1:
+            out[-1] = (out[-1][0], n)
+        else:
+            out.append((n, n))
+    return out
+
+
+def parse_line_history(text: str) -> list[HistoryCommit]:
+    """Parse ``git log -L … --format=HISTORY_FORMAT`` output."""
+    out: list[HistoryCommit] = []
+    for record in text.split("\x1e")[1:]:
+        parts = record.split("\x1f", 5)
+        if len(parts) < 6:
+            continue
+        sha, short, author, at, message, rest = parts
+        diff: list[str] = []
+        created = False
+        for line in rest.split("\n"):
+            if diff or line.startswith("@@"):
+                diff.append(line)
+            elif line.startswith("--- /dev/null"):
+                created = True
+        while diff and not diff[-1]:
+            diff.pop()
+        out.append(HistoryCommit(sha, short, author, int(at) if at.isdigit() else 0, message.strip("\n"), diff, created))
+    return out
+
 
 _FIELD = "\x1f"
 _RECORD = "\x1e"
@@ -46,6 +108,7 @@ class LocalGit:
         self._env: Optional[dict] = None
         self._scratch: Optional[str] = None
         self._objects: Optional[str] = None
+        self._email: Optional[str] = None
 
     @property
     def available(self) -> bool:
@@ -181,6 +244,31 @@ class LocalGit:
     def ensure_commit(self, sha: str, ref: str) -> None:
         if not self.has_commit(sha):
             self.fetch(ref)
+
+    def blame(self, rev: str, path: str, lines: Sequence[int]) -> tuple[dict[int, str], dict[str, BlameCommit]]:
+        """The commit that last changed each of ``lines`` of ``path`` as it is in ``rev`` (git blame)."""
+        ranges = [arg for a, b in line_ranges(lines) for arg in ("-L", f"{a},{b}")]
+        return parse_blame(self.git("blame", "--porcelain", *ranges, rev, "--", path, title="Blame", timeout=180))
+
+    def user_email(self) -> str:
+        if self._email is None:
+            res = self.runner.run(["git", "-C", str(self.repo), "config", "user.email"], env=self.env(), check=False, timeout=15)
+            self._email = res.stdout.strip().lower()
+        return self._email
+
+    def line_history(self, rev: str, path: str, start: int, end: int, limit: int = 20) -> list[HistoryCommit]:
+        """The commits that changed lines ``start``-``end`` of ``path`` as it is in ``rev``, newest first."""
+        out = self.git(
+            "log",
+            f"-L{start},{end}:{path}",
+            f"--max-count={limit}",
+            "--no-color",
+            f"--format={HISTORY_FORMAT}",
+            rev,
+            title="Line history",
+            timeout=180,
+        )
+        return parse_line_history(out)
 
     # -- merge conflicts (Gerrit's "mergeable") ------------------------------------------------
 
