@@ -1,3 +1,4 @@
+import time
 import unittest
 
 from lazygerrit.diff import LineRef, file_as_added, parse_unified
@@ -47,6 +48,16 @@ class DiffTest(unittest.TestCase):
         lines, _ = render.diff_lines("a.py", rows, [], 80)
         emphasized = [[t for t, st in ln if st.bg != -1] for ln in lines if any(st.bg != -1 for _, st in ln)]
         self.assertEqual(emphasized, [["100"], ["128"]])
+
+    def test_update_stamps(self):
+        def at(*ymdhm):
+            return time.mktime((*ymdhm, 0, 0, 0, -1))
+
+        now = at(2026, 11, 17, 15, 0)
+        self.assertEqual(render.short_stamp(at(2026, 11, 17, 9, 5), now), "09:05")
+        self.assertEqual(render.short_stamp(at(2026, 11, 16, 23, 59), now), "16 Nov")
+        self.assertEqual(render.short_stamp(at(2026, 2, 3, 12, 0), now), "3 Feb")
+        self.assertEqual(render.short_stamp(at(2025, 12, 31, 12, 0), now), "2025")
 
     def test_highlighted_lines_must_match_the_diff_line_for_line(self):
         rows = parse_unified(DIFF)

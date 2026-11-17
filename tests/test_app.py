@@ -118,6 +118,14 @@ class LayoutAndNavigationTest(AppTestCase):
         self.assertEqual(self.app.focus, "stack")
         self.assertIn("not on Gerrit", self.screen())
 
+    def test_rows_show_when_changes_were_updated(self):
+        self.press("]")  # Incoming: Kim's change was updated 2 hours ago
+        kim = next(c for c in self.app.p_changes.view() if c.number == 100200)
+        row = plain(self.app.p_changes.row_fn(kim, 120))
+        self.assertEqual(row[:15], "100200 ✓ +1  · ")
+        self.assertEqual(row[15:21], render.short_stamp(kim.last_updated).rjust(6))
+        self.assertTrue(row[21:].startswith(" ● KC "), row)
+
     def test_keybindings_menu(self):
         self.press("?")
         self.assertIsInstance(self.app.popups[-1], MenuPopup)

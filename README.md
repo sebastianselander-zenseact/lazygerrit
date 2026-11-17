@@ -90,8 +90,9 @@ underneath shows every command that changed something on Gerrit.
 | `[4] Files - CI` | files of the patch set you are reviewing (`✓` reviewed, `✎` your drafts, `●` unresolved / `○` other comments), and CI: live Zuul jobs with progress plus the latest Zuul reports, parsed into jobs. |
 | `[5] Comments - Messages` | your drafts, then comment threads (unresolved first; `f` toggles resolved and CI comments, using the same rules as `rng comments`) and the change messages. |
 
-List rows: `✓`/`✗` Verified, then Code-Review and Secondary-Review (`+2`, `-1`, `·` = none),
-`●` unresolved comments, `✎N` your unpublished drafts, owner initials on other people's changes.
+List rows: `✓`/`✗` Verified, then Code-Review and Secondary-Review (`+2`, `-1`, `·` = none), when the
+change was last updated (`14:45` today, `12 Nov` earlier this year, else the year), `●` unresolved
+comments, `✎N` your unpublished drafts, owner initials on other people's changes.
 
 ## Keybindings
 

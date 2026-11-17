@@ -70,6 +70,21 @@ def rel_time(ts: Optional[float], ref: Optional[float] = None) -> str:
     return f"{int(d // (86400 * 365))}y"
 
 
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def short_stamp(ts: Optional[float], ref: Optional[float] = None) -> str:
+    """When something happened in at most 6 characters: 14:45 today, 12 Nov this year, else the year."""
+    if not ts:
+        return ""
+    t, r = time.localtime(ts), time.localtime(ref or now())
+    if (t.tm_year, t.tm_yday) == (r.tm_year, r.tm_yday):
+        return f"{t.tm_hour:02d}:{t.tm_min:02d}"
+    if t.tm_year == r.tm_year:
+        return f"{t.tm_mday} {_MONTHS[t.tm_mon - 1]}"
+    return str(t.tm_year)
+
+
 def rel_ago(ts: Optional[float]) -> str:
     r = rel_time(ts)
     return f"{r} ago" if r else ""
@@ -175,6 +190,8 @@ def change_row(
     parts.append(vote_span(ch.label_value("Code-Review")))
     parts.append((" ", PLAIN))
     parts.append(vote_span(ch.label_value("Secondary-Review")))
+    parts.append((" ", PLAIN))
+    parts.append((short_stamp(ch.last_updated).rjust(6), theme.DIM))
     parts.append((" ", PLAIN))
     parts.append(("●", theme.WARN) if ch.has_unresolved else (" ", PLAIN))
     parts.append((" ", PLAIN))
@@ -912,6 +929,10 @@ def status_dashboard(
             (" ", PLAIN),
             ("-1", theme.BAD),
             ("  Code-Review, Secondary-Review   ", PLAIN),
+            ("14:45", theme.DIM),
+            (" / ", PLAIN),
+            ("12 Nov", theme.DIM),
+            ("  last updated   ", PLAIN),
             ("●", theme.WARN),
             ("  unresolved comments   ", PLAIN),
             CONFLICT_TAG,
