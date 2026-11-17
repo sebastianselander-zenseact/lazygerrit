@@ -650,8 +650,7 @@ def change_details(
             out.append(kv("Commit", [(ps.revision[:12], theme.HASH), (f"  {ps.ref}", theme.DIM)]))
     out.append(kv("URL", [(f"{base_url}/c/{ch.project}/+/{ch.number}", theme.LINK)]))
     humans = [r for r in ch.reviewers if r.username != ch.owner.username and not r.is_bot()]
-    if humans:
-        out.append(kv("Reviewers", ", ".join(r.display for r in humans)))
+    out.append(kv("Reviewers", ", ".join(r.display for r in humans) or "<empty>"))
     out.append([])
     out += labels_section(ch)
     out.append([])
