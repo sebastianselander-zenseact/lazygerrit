@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from typing import Callable, Optional, Sequence
 
 from .backend import Backend
 from .drafts import Draft
+from .emoji import terminal_safe
 from .gerrit import CommandError
 from .models import PATCHSET_LEVEL, Change, Thread
 from .srcrepo import run_selected_comment
@@ -329,7 +331,9 @@ def publish_review(
 
 
 def _first_line(text: str) -> str:
-    return next((" ".join(ln.split()) for ln in text.splitlines() if ln.strip()), "")
+    """The first line, normalised like the UI's first_line() that reply_to_text comes from."""
+    line = next((ln for ln in text.splitlines() if ln.strip()), "")
+    return " ".join(terminal_safe(re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", line)).split())
 
 
 def link_replies(drafts: Sequence[Draft], threads: Sequence[Thread]) -> list[Draft]:
@@ -339,7 +343,7 @@ def link_replies(drafts: Sequence[Draft], threads: Sequence[Thread]) -> list[Dra
     for d in drafts:
         target: Optional[Thread] = None
         if d.reply_to_text and not d.in_reply_to:
-            want = " ".join(d.reply_to_text.split())
+            want = _first_line(d.reply_to_text)
             here = [
                 t
                 for t in threads

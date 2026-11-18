@@ -6,6 +6,7 @@ import curses
 from dataclasses import dataclass
 from typing import Optional, Union
 
+from ..emoji import terminal_safe
 from .text import PLAIN, Line, Style, char_width, clip, sanitize, text_width
 
 
@@ -172,8 +173,10 @@ class CursesCanvas(Canvas):
             return
         if x < 0:
             return
-        if not text.isprintable():
-            text = sanitize(text)
+        if not text.isascii():
+            text = terminal_safe(text)  # ncurses must count cells like the terminal does
+            if not text.isprintable():
+                text = sanitize(text)
         try:
             self.scr.addstr(y, x, text, self.attr(style))
         except curses.error:

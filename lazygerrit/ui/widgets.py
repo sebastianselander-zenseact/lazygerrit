@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
+from ..emoji import Emoji, EmojiIndex, suggestion_label, typing_query
 from . import theme
 from .layout import Rect
 from .screen import Canvas, Event, Key, Paste
@@ -918,6 +919,125 @@ class TextBuffer:
         self.col = len(self.lines[self.row])
 
 
+def visual_rows(tb: TextBuffer, width: int) -> tuple[list[str], tuple[int, int]]:
+    """Soft-wrap a text buffer into rows of ``width`` cells; the rows and the cursor's (row, col) in cells."""
+    rows: list[str] = []
+    cur = (0, 0)
+    for li, text in enumerate(tb.lines):
+        chunks: list[tuple[int, str]] = []
+        start = 0
+        buf = ""
+        used = 0
+        for ci, ch in enumerate(text):
+            w = char_width(ch)
+            if used + w > width:
+                chunks.append((start, buf))
+                start, buf, used = ci, "", 0
+            buf += ch
+            used += w
+        chunks.append((start, buf))
+        for idx, (st, chunk) in enumerate(chunks):
+            last = idx == len(chunks) - 1
+            if li == tb.row and st <= tb.col and (tb.col < st + len(chunk) or last):
+                cur = (len(rows), text_width(chunk[: tb.col - st]))
+            rows.append(chunk)
+    return rows, cur
+
+
+class EmojiAssist:
+    """Slack-style emoji while writing in a TextBuffer: suggestions for ``:na`` (two characters or
+    more), and a :shortcode: becomes its emoji as soon as its closing colon is typed. Backspace right
+    after that brings the typed text back."""
+
+    def __init__(self, index: EmojiIndex):
+        self.index = index
+        self.items: list[Emoji] = []
+        self.sel = 0
+        self._dismissed: Optional[tuple[int, int]] = None  # (row, colon) whose suggestions esc hid
+        self._undo: Optional[tuple[int, int, str, str]] = None  # row, start, what was typed, what replaced it
+
+    @property
+    def active(self) -> bool:
+        return bool(self.items)
+
+    def update(self, buf: "TextBuffer") -> None:
+        q = typing_query(buf.lines[buf.row][: buf.col])
+        if q is None or self._dismissed == (buf.row, q[0]):
+            self._dismissed = self._dismissed if q is not None else None
+            self.items = []
+            return
+        items = self.index.complete(q[1])
+        if [e.name for e in items] != [e.name for e in self.items]:
+            self.sel = 0
+        self.items = items
+
+    def key(self, k: str, buf: "TextBuffer") -> bool:
+        """Keys while suggestions are shown: tab/enter insert one, up/down choose, esc hides them."""
+        if k in ("<tab>", "<enter>"):
+            q = typing_query(buf.lines[buf.row][: buf.col])
+            if q is not None:
+                self._replace(buf, q[0], self.index.text_for(self.items[self.sel]))
+            self.items = []
+        elif k in ("<up>", "<c-p>"):
+            self.sel = (self.sel - 1) % len(self.items)
+        elif k in ("<down>", "<c-n>"):
+            self.sel = (self.sel + 1) % len(self.items)
+        elif k == "<esc>":
+            q = typing_query(buf.lines[buf.row][: buf.col])
+            self._dismissed = (buf.row, q[0]) if q is not None else None
+            self.items = []
+        else:
+            return False
+        self._undo = None
+        return True
+
+    def typed_colon(self, buf: "TextBuffer") -> None:
+        """After a ":" was typed: turn a just-closed :shortcode: into its emoji."""
+        before = buf.lines[buf.row][: buf.col]
+        hit = self.index.typed(before)
+        if hit is None or before[hit[0] :] == hit[1]:
+            return
+        start, text = hit
+        self._undo = (buf.row, start, before[start:], text)
+        self._replace(buf, start, text)
+
+    def undo(self, buf: "TextBuffer") -> bool:
+        """Backspace right after a :shortcode: became an emoji: the typed text again, minus the colon."""
+        u, self._undo = self._undo, None
+        if u is None:
+            return False
+        row, start, typed, text = u
+        if buf.row != row or buf.col != start + len(text) or buf.lines[row][start : buf.col] != text:
+            return False
+        self._replace(buf, start, typed[:-1])
+        return True
+
+    def forget(self) -> None:
+        self._undo = None
+
+    @staticmethod
+    def _replace(buf: "TextBuffer", start: int, text: str) -> None:
+        line = buf.lines[buf.row]
+        buf.lines[buf.row] = line[:start] + text + line[buf.col :]
+        buf.col = start + len(text)
+
+    def lines(self, width: int) -> list[Line]:
+        out: list[Line] = []
+        for i, e in enumerate(self.items):
+            glyph, code, note = suggestion_label(e, self.index)
+            if text_width(glyph) > 2:  # custom text, e.g. "LGTM ✅"
+                glyph, note = " ", f"→ {glyph}"
+            ln: Line = [(f" {glyph}" + " " * (3 - text_width(glyph)), PLAIN), (code, PLAIN)]
+            if note:
+                ln.append((f"  {note}", theme.DIM))
+            ln = truncate(ln, width)
+            out.append(pad(restyle(ln, SELECTED), width, SELECTED) if i == self.sel else ln)
+        return out
+
+    def options(self) -> list[tuple[str, str]]:
+        return [("Insert emoji", "<tab>/<enter>"), ("Choose", "↑/↓"), ("Hide", "<esc>")]
+
+
 class PromptPopup(Popup):
     def __init__(
         self,
@@ -932,8 +1052,10 @@ class PromptPopup(Popup):
         allow_empty: bool = False,
         on_editor: Optional[Callable[[str], None]] = None,
         width: Optional[int] = None,
+        emoji: Optional[EmojiIndex] = None,
     ):
         self.title = title
+        self.emoji = EmojiAssist(emoji) if emoji is not None else None
         self.on_submit = on_submit
         self.buf = TextBuffer(initial)
         self.multiline = multiline
@@ -960,6 +1082,8 @@ class PromptPopup(Popup):
         return t.strip()
 
     def _update_suggestions(self) -> None:
+        if self.emoji is not None:
+            self.emoji.update(self.buf)
         if not self.suggest:
             self.suggestions = []
             return
@@ -992,15 +1116,26 @@ class PromptPopup(Popup):
         self.on_submit(text)
 
     def handle(self, ev: Event) -> bool:
+        em = self.emoji
         if isinstance(ev, Paste):
             text = ev.text if self.multiline else ev.text.replace("\n", " ")
             self.buf.insert(text)
+            if em is not None:
+                em.forget()
             self._update_suggestions()
             return True
         if not isinstance(ev, Key):
             return True
         k = ev.name
         b = self.buf
+        if em is not None:
+            if em.active and em.key(k, b):
+                self._update_suggestions()
+                return True
+            if k == "<backspace>" and em.undo(b):
+                self._update_suggestions()
+                return True
+            em.forget()
         if k == "<esc>":
             self.close()
         elif k == "<enter>":
@@ -1047,12 +1182,16 @@ class PromptPopup(Popup):
             b.insert(" ")
         elif len(k) == 1:
             b.insert(k)
+            if k == ":" and em is not None:
+                em.typed_colon(b)
         else:
             return True
         self._update_suggestions()
         return True
 
     def options(self) -> list[tuple[str, str]]:
+        if self.emoji is not None and self.emoji.active:
+            return self.emoji.options()
         opts = [("Confirm", "<enter>")]
         if self.multiline:
             opts.append(("New line", "<a-enter>/<c-j>"))
@@ -1064,28 +1203,7 @@ class PromptPopup(Popup):
         return opts
 
     def _visual_rows(self, width: int) -> tuple[list[str], tuple[int, int]]:
-        """Soft-wrap the buffer into rows; return rows and the cursor's (row, col) in cells."""
-        rows: list[str] = []
-        cur = (0, 0)
-        for li, text in enumerate(self.buf.lines):
-            chunks: list[tuple[int, str]] = []
-            start = 0
-            buf = ""
-            used = 0
-            for ci, ch in enumerate(text):
-                w = char_width(ch)
-                if used + w > width:
-                    chunks.append((start, buf))
-                    start, buf, used = ci, "", 0
-                buf += ch
-                used += w
-            chunks.append((start, buf))
-            for idx, (st, chunk) in enumerate(chunks):
-                last = idx == len(chunks) - 1
-                if li == self.buf.row and st <= self.buf.col and (self.buf.col < st + len(chunk) or last):
-                    cur = (len(rows), text_width(chunk[: self.buf.col - st]))
-                rows.append(chunk)
-        return rows, cur
+        return visual_rows(self.buf, width)
 
     def render(self, canvas: Canvas) -> None:
         w = self.fixed_width or max(50, min(100, int(canvas.width * 0.55)))
@@ -1098,8 +1216,9 @@ class PromptPopup(Popup):
         hint_lines = wrap(self.hint, inner_w) if self.hint else []
         h = body_h + 2 + len(hint_lines)
         rect = centered(canvas, w, h)
-        if self.suggestions and not self.multiline:
-            rect = Rect(max(0, rect.y - len(self.suggestions) // 2 - 1), rect.x, rect.h, rect.w)
+        sug_title, sug_lines = self._suggestion_box(inner_w)
+        if sug_lines:
+            rect = Rect(max(0, rect.y - len(sug_lines) // 2 - 1), rect.x, rect.h, rect.w)
         self.rect = rect
         fill_rect(canvas, rect)
         inner = rect.inner
@@ -1114,18 +1233,26 @@ class PromptPopup(Popup):
             canvas.put(inner.y + body_h + i, inner.x, hl, theme.DIM)
         self._cursor = (inner.y + (cr - top), min(inner.x + cc, inner.x + inner.w - 1))
         draw_frame(canvas, rect, title=[(self.title, self.border)], border=self.border)
-        if self.suggestions and not self.multiline:
-            srect = Rect(rect.y + rect.h, rect.x, min(len(self.suggestions) + 2, canvas.height - 1 - rect.y - rect.h), rect.w)
+        if sug_lines:
+            srect = Rect(rect.y + rect.h, rect.x, min(len(sug_lines) + 2, canvas.height - 1 - rect.y - rect.h), rect.w)
             if srect.h >= 3:
                 fill_rect(canvas, srect)
                 si = srect.inner
-                for i, s in enumerate(self.suggestions[: si.h]):
-                    label = s[1] if isinstance(s, tuple) else s
-                    style = SELECTED if i == self.sug_sel else PLAIN
-                    canvas.put_line(
-                        si.y + i, si.x, [(truncate_str(label, si.w), style)], si.w, fill=style if i == self.sug_sel else None
-                    )
-                draw_frame(canvas, srect, title=[("Suggestions", theme.INACTIVE_BORDER)], border=theme.INACTIVE_BORDER)
+                for i, ln in enumerate(sug_lines[: si.h]):
+                    canvas.put_line(si.y + i, si.x, ln, si.w)
+                draw_frame(canvas, srect, title=[(sug_title, theme.INACTIVE_BORDER)], border=theme.INACTIVE_BORDER)
+
+    def _suggestion_box(self, width: int) -> tuple[str, list[Line]]:
+        """The title and lines of the suggestion list under the prompt (none when there is none)."""
+        if self.emoji is not None and self.emoji.active:
+            return "Emoji", self.emoji.lines(width)
+        if not self.suggestions or self.multiline:
+            return "", []
+        out: list[Line] = []
+        for i, s in enumerate(self.suggestions):
+            ln: Line = [(truncate_str(s[1] if isinstance(s, tuple) else s, width), PLAIN)]
+            out.append(pad(restyle(ln, SELECTED), width, SELECTED) if i == self.sug_sel else ln)
+        return "Suggestions", out
 
     def cursor(self) -> Optional[tuple[int, int]]:
         return self._cursor
@@ -1146,9 +1273,11 @@ class ReviewPopup(Popup):
         message: str = "",
         focus_message: bool = False,
         on_editor: Optional[Callable[[dict[str, int], str], None]] = None,
+        emoji: Optional[EmojiIndex] = None,
     ):
         self.title = title
         self.warning = warning
+        self.emoji = EmojiAssist(emoji) if emoji is not None else None
         self.labels = [(name, list(values), current) for name, values, current in labels]
         # ``labels`` carry your current votes; ``chosen`` preselects others (e.g. when reopened after a failure).
         self.values = {name: (chosen or {}).get(name, current) for name, _, current in self.labels}
@@ -1184,11 +1313,29 @@ class ReviewPopup(Popup):
         if isinstance(ev, Paste):
             if self.on_message:
                 self.buf.insert(ev.text)
+                if self.emoji is not None:
+                    self.emoji.forget()
+                    self.emoji.update(self.buf)
             return True
         if not isinstance(ev, Key):
             return True
-        k = ev.name
+        self._handle_key(ev.name)
+        if self.emoji is not None:
+            if self.on_message:
+                self.emoji.update(self.buf)
+            else:
+                self.emoji.items = []
+        return True
+
+    def _handle_key(self, k: str) -> None:
         b = self.buf
+        em = self.emoji if self.on_message else None
+        if em is not None:
+            if em.active and em.key(k, b):
+                return
+            if k == "<backspace>" and em.undo(b):
+                return
+            em.forget()
         if k == "<esc>":
             self.close()
         elif k == "<enter>":
@@ -1213,6 +1360,8 @@ class ReviewPopup(Popup):
                 # Typing anywhere writes the message, so text can never change a vote by accident.
                 self.field = len(self.labels)
                 b.insert(" " if k == "<space>" else k)
+                if k == ":" and self.emoji is not None:
+                    self.emoji.typed_colon(b)
         else:
             if k in ("<a-enter>", "<c-j>"):
                 b.insert("\n")
@@ -1245,9 +1394,12 @@ class ReviewPopup(Popup):
                 b.insert(" ")
             elif len(k) == 1:
                 b.insert(k)
-        return True
+                if k == ":" and em is not None:
+                    em.typed_colon(b)
 
     def options(self) -> list[tuple[str, str]]:
+        if self.emoji is not None and self.emoji.active:
+            return self.emoji.options()
         opts = [("Send", "<enter>"), ("Next field", "<tab>")]
         if self.on_message:
             opts.append(("New line", "<a-enter>"))
@@ -1291,26 +1443,15 @@ class ReviewPopup(Popup):
             ]
         )
         msg_top = len(rows)
-        body_w = inner_w - 4
-        vis: list[str] = []
-        cur = (0, 0)
-        for li, text in enumerate(self.buf.lines):
-            chunks = [text[k : k + body_w] for k in range(0, max(1, len(text)), body_w)] or [""]
-            for ci, chunk in enumerate(chunks):
-                start = ci * body_w
-                if (
-                    li == self.buf.row
-                    and start <= self.buf.col <= start + len(chunk)
-                    and (self.buf.col < start + len(chunk) or ci == len(chunks) - 1)
-                ):
-                    cur = (len(vis), text_width(chunk[: self.buf.col - start]))
-                vis.append(chunk)
+        vis, cur = visual_rows(self.buf, inner_w - 4)
         box_h = max(3, min(8, len(vis)))
         top = max(0, cur[0] - box_h + 1)
         for i in range(box_h):
             j = top + i
             text = vis[j] if j < len(vis) else ""
             rows.append([("  ", PLAIN), ("│ ", theme.ACTIVE_BORDER if msg_focus else theme.DIM), (text, PLAIN)])
+        if self.emoji is not None and self.emoji.active:
+            rows += [[("    ", PLAIN), *ln] for ln in self.emoji.lines(inner_w - 4)]
         rows.append([])
         rows += [list(s) for s in self.summary]
         h = min(len(rows) + 2, canvas.height - 2)

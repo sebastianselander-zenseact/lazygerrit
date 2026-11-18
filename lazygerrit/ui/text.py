@@ -7,6 +7,8 @@ import unicodedata
 from dataclasses import dataclass, replace
 from functools import lru_cache
 
+from ..emoji import terminal_safe
+
 DEFAULT_COLOR = -1
 BLACK, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, WHITE = range(8)
 BRIGHT_BLACK = 8
@@ -68,10 +70,10 @@ def char_width(ch: str) -> int:
         return 0
     if o < 0x300:
         return 1
-    if unicodedata.combining(ch):
-        return 0
-    if o in (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF) or 0xFE00 <= o <= 0xFE0F:
-        return 0
+    if 0x1F3FB <= o <= 0x1F3FF:
+        return 0  # skin tones: dropped when drawn (see emoji.terminal_safe)
+    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0  # combining and enclosing marks (keycaps), joiners, variation selectors, emoji tags
     if unicodedata.east_asian_width(ch) in ("W", "F"):
         return 2
     return 1
@@ -91,7 +93,7 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
 def sanitize(s: str, tab_width: int = 4) -> str:
-    """Expand tabs and drop control characters so text is safe to draw."""
+    """Expand tabs, drop control characters and simplify emoji (see terminal_safe) so text is safe to draw."""
     if "\t" in s:
         out = []
         col = 0
@@ -106,7 +108,8 @@ def sanitize(s: str, tab_width: int = 4) -> str:
         s = "".join(out)
     if "\n" in s:
         s = s.replace("\r\n", " ").replace("\n", " ")
-    return _CONTROL_RE.sub("", s)
+    s = _CONTROL_RE.sub("", s)
+    return s if s.isascii() else terminal_safe(s)
 
 
 def text_block(text: str, style: Style = PLAIN) -> list[Line]:

@@ -208,6 +208,20 @@ class ReplyLinkingTest(unittest.TestCase):
         self.assertEqual((linked[0].side, linked[0].range, linked[0].id), ("PARENT", rng, drafts[0].id))
         self.assertEqual(linked[3:], drafts[3:])
 
+    def test_link_replies_to_threads_with_emoji(self):
+        from lazygerrit.drafts import Draft
+        from lazygerrit.models import Account, Comment, Thread
+        from lazygerrit.ui.render import first_line
+
+        def thread(cid, text):
+            c = Comment(path="a.py", line=5, author=Account(name="R"), message=text, patch_set=1, id=cid)
+            return Thread(path="a.py", line=5, patch_set=1, comments=[c], unresolved=True)
+
+        threads = [thread("a", "Other"), thread("b", "Nice ❤️ work 👍🏽\nreally")]
+        # reply_to_text is what the UI showed: first_line() draws emoji in their terminal-safe form
+        d = Draft(change=1, patch_set=1, path="a.py", line=5, message="Ack", reply_to_text=first_line(threads[1].last.message))
+        self.assertEqual(ops.link_replies([d], threads)[0].in_reply_to, "b")
+
     def test_done_without_rest_resolves_the_thread(self):
         """Without REST the threads come from the change's meta ref: a reply drafted from SSH data
         (no comment ids) joins its thread, so Done resolves it instead of adding a separate comment."""

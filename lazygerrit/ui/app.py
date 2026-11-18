@@ -24,6 +24,16 @@ from ..backend import Backend, NeedsRest
 from ..config import Config
 from ..diff import LineRef, parse_unified
 from ..drafts import Draft, StateStore
+from ..emoji import (
+    CACHE_MAX_AGE,
+    SLACK_EMOJI_API,
+    EmojiIndex,
+    SlackError,
+    fetch_workspace,
+    read_cache,
+    read_workspace_file,
+    write_cache,
+)
 from ..gerrit import CommandError, CommandEvent, RestError
 from ..models import COMMIT_MSG, Account, Change, CIJob, FileInfo, LocalCommit, MergeInfo, Thread
 from ..parsing import ci_messages, ci_state, filter_threads, latest_report, threads_from_change, zuul_merge_failure
@@ -216,10 +226,53 @@ class App(ReviewMixin):
         self.syntax_command = syntax_command(cfg.syntax_highlight)
         self.diff_styles: dict[tuple, dict[int, Any]] = {}
         self.syntax_warned = False
+        self.emoji = EmojiIndex(cfg.custom_emoji, skin_tone=cfg.emoji_skin_tone)
+        self.slack_token = "" if demo else (cfg.slack_token or os.environ.get("LAZYGERRIT_SLACK_TOKEN") or "")
+        self._load_emoji()
         self.bindings: list[Binding] = []
         self._build_bindings()
         self._setup_panels()
         self._update_cmdlog()
+
+    def _load_emoji(self) -> None:
+        """The Slack workspace's custom emoji: from slack_emoji_file and from what Slack listed last."""
+        self.cfg.problems += self.emoji.problems
+        self.file_emoji: dict[str, str] = {}
+        if self.cfg.slack_emoji_file:
+            try:
+                self.file_emoji = read_workspace_file(self.cfg.slack_emoji_file)
+            except (OSError, ValueError) as e:
+                self.cfg.problems.append(f"slack_emoji_file: {e}")
+        cached, age = read_cache(self.slack_token) if self.slack_token else (None, 0.0)
+        self.slack_emoji_stale = bool(self.slack_token) and (cached is None or age > CACHE_MAX_AGE)
+        self.emoji.set_workspace({**self.file_emoji, **(cached or {})})
+
+    def refresh_slack_emoji(self) -> None:
+        """Fetch the workspace's custom emoji from Slack (in the background) and remember them a day."""
+        token = self.slack_token
+        start = time.monotonic()
+
+        def work() -> dict[str, str]:
+            emoji = fetch_workspace(token)
+            try:
+                write_cache(token, emoji)
+            except OSError:
+                pass  # fetched again on the next start
+            return emoji
+
+        def done(emoji: dict[str, str]) -> None:
+            self.slack_emoji_stale = False
+            self.emoji.set_workspace({**self.file_emoji, **emoji})
+            took = time.monotonic() - start
+            self.be.runner.emit(CommandEvent("Slack emoji", f"GET {SLACK_EMOJI_API}", "ok", f"{len(emoji)} custom emoji", took))
+
+        def failed(e: BaseException) -> None:
+            self.slack_emoji_stale = False  # not again until the next start
+            msg = str(e) if isinstance(e, (SlackError, OSError, ValueError)) else repr(e)
+            self.be.runner.emit(CommandEvent("Slack emoji", f"GET {SLACK_EMOJI_API}", "error", msg, time.monotonic() - start))
+            self.show_toast(f"Slack emoji: {msg}", error=True, seconds=8)
+
+        self.submit("slack-emoji", work, done, on_error=failed)
 
     # ------------------------------------------------------------------ setup
 
@@ -350,6 +403,8 @@ class App(ReviewMixin):
         return suspend
 
     def start(self) -> None:
+        if self.slack_emoji_stale:
+            self.refresh_slack_emoji()
         self.load_status()
         self.load_tab(self.p_changes.tab)
         self.load_stack()
@@ -1577,8 +1632,12 @@ class App(ReviewMixin):
     def confirm(self, title: str, text: str, fn: Callable[[], None]) -> None:
         self.push(ConfirmPopup(title, text, fn))
 
-    def prompt(self, title: str, on_submit: Callable[[str], None], **kw: Any) -> None:
-        self.push(PromptPopup(title, on_submit, **kw))
+    def prompt(self, title: str, on_submit: Callable[[str], None], emoji: bool = False, **kw: Any) -> None:
+        """A text prompt; ``emoji`` for text that gets posted (comments), with :shortcode: completion."""
+        self.push(PromptPopup(title, on_submit, emoji=self.emoji_index() if emoji else None, **kw))
+
+    def emoji_index(self) -> Optional[EmojiIndex]:
+        return self.emoji if self.cfg.emoji_completion else None
 
     def error(self, text: str, title: str = "Error") -> None:
         self.push(MessagePopup(title, text, error=True))
@@ -2326,6 +2385,7 @@ class App(ReviewMixin):
             f"prio_high reason for {self.names(ts)}",
             submit,
             hint=f"Adds {', '.join('#' + t for t in tags)} and posts 'prio_high reason: <reason>'",
+            emoji=True,
         )
 
     def do_tower(self, ch: Change, kind: str, **kw: Any) -> None:
@@ -2444,6 +2504,8 @@ class App(ReviewMixin):
             except OSError:
                 pass
         text = text.split(SCISSORS, 1)[0].rstrip()
+        if self.cfg.emoji_completion:
+            text = self.emoji.emojize(text)
         if text.strip():
             on_done(text)
         else:
@@ -2673,6 +2735,7 @@ class App(ReviewMixin):
             submit,
             allow_empty=True,
             hint="Optional message. Enter abandons the change, Esc cancels.",
+            emoji=True,
         )
 
     def act_checkout(self) -> None:

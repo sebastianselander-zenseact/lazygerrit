@@ -13,6 +13,7 @@ from unittest import mock
 from lazygerrit.demo import _FILES_BASE, ME, GerritFailure, _commit, _run, cleanup_demo, create_demo
 from lazygerrit.diff import LineRef
 from lazygerrit.drafts import Draft, StateStore
+from lazygerrit.emoji import SlackError
 from lazygerrit.gerrit import CommandError
 from lazygerrit.renderers import DiffRenderer
 from lazygerrit.ui.app import App
@@ -820,6 +821,72 @@ class WorktreeTest(AppTestCase):
         self.press("<enter>")
         self.assertIsInstance(self.app.popups[-1], MessagePopup)
         self.assertIn("already exists", self.app.popups[-1].message)
+
+
+class EmojiTest(AppTestCase):
+    def comment_prompt(self):
+        self.select_change(100101)
+        self.press("4", "j", "<enter>")
+        meta = self.app.p_main.meta
+        target = next(i for i, m in enumerate(meta) if isinstance(m, LineRef) and m.line == 7 and m.side is None)
+        self.press(*(["j"] * (target - self.app.p_main.cursor)), "c")
+        return self.app.popups[-1]
+
+    def test_slack_shortcodes_in_a_comment(self):
+        prompt = self.comment_prompt()
+        self.type("why :thu")
+        self.assertIn("👍 :thumbsup:", self.screen().replace("\n", ""))
+        self.assertIn("Insert emoji: <tab>", self.screen().splitlines()[-1])
+        self.press("<tab>")
+        self.type(" :tada:")
+        self.assertEqual(prompt.text, "why 👍 🎉")
+        self.press("<backspace>")  # undoes the conversion
+        self.assertEqual(prompt.text, "why 👍 :tada")
+        self.press("<esc>")  # hides the suggestions, keeps the prompt
+        self.assertIs(self.app.popups[-1], prompt)
+        self.press("<enter>")
+        self.assertEqual([d.message for d in self.app.state.drafts_for(100101)], ["why 👍 :tada"])
+
+    def test_review_message_and_editor_text(self):
+        self.select_change(100101)
+        self.press("c")
+        self.type("Thanks :tad")
+        self.press("<tab>")
+        self.assertEqual(self.app.popups[-1].message, "Thanks 🎉")
+
+        def editor(cmd):
+            Path(cmd[-1]).write_text("Thanks 🎉 :+1: `x[:tada:]`\n")
+            return 0
+
+        with mock.patch("lazygerrit.ui.app.subprocess.call", side_effect=editor):
+            self.press("<c-o>")
+        self.assertEqual(self.app.popups[-1].message, "Thanks 🎉 👍 `x[:tada:]`")
+        self.press("<enter>")
+        self.assertEqual(self.server.changes[100101]["_comments"][-1]["message"], "Thanks 🎉 👍 `x[:tada:]`")
+
+    def test_no_emoji_where_text_is_not_posted(self):
+        self.press("s")
+        self.type("status:op")
+        self.assertIsNone(self.app.popups[-1].emoji)
+        self.assertNotIn("Emoji", self.screen())
+
+    def test_workspace_emoji_from_slack(self):
+        self.app.slack_token = "xoxp-test"
+        workspace = {"party-parrot": "https://emoji.slack-edge.com/T1/party-parrot/1.gif", "yes": "alias:+1"}
+        with mock.patch("lazygerrit.ui.app.fetch_workspace", return_value=workspace), mock.patch("lazygerrit.ui.app.write_cache"):
+            self.app.refresh_slack_emoji()
+            self.settle()
+        prompt = self.comment_prompt()
+        self.type(":party-p")
+        self.assertIn(":party-parrot:  workspace image: posted as text", self.screen())
+        self.press("<tab>")
+        self.type(" :yes:")
+        self.assertEqual(prompt.text, ":party-parrot: 👍")
+        failure = SlackError("Slack did not list the workspace's emoji: invalid_auth")
+        with mock.patch("lazygerrit.ui.app.fetch_workspace", side_effect=failure):
+            self.app.refresh_slack_emoji()
+            self.settle()
+        self.assertIn("invalid_auth", self.app.toast[0])
 
 
 class WithoutRestTest(AppTestCase):

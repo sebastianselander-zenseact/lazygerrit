@@ -978,6 +978,7 @@ class ReviewMixin:
             f"Draft comment on {where} (ps{ref.patch_set})",
             save,
             multiline=True,
+            emoji=True,
             hint="Saved as a draft (unresolved). Publish all your drafts together, with a vote and message, using p.",
             on_editor=lambda cur: self.edit_text([f"Comment on {where} in {n},{ref.patch_set}"], cur, save),
         )
@@ -1007,6 +1008,7 @@ class ReviewMixin:
             save,
             initial=d.message,
             multiline=True,
+            emoji=True,
             allow_empty=True,
             hint="An empty message deletes the draft.",
             on_editor=lambda cur: self.edit_text([f"Draft on {d.location} in {d.change},{d.patch_set}"], cur, save),
@@ -1070,6 +1072,7 @@ class ReviewMixin:
             f"Reply to {t.location}{state}",
             save,
             multiline=True,
+            emoji=True,
             hint=hint,
             on_editor=lambda cur: self.edit_text(
                 [f"Reply to {t.location} on {n},{t.patch_set}", *("> " + ln for ln in t.last.message.splitlines()[:10])],
@@ -1167,6 +1170,7 @@ class ReviewMixin:
                 message=message,
                 focus_message=focus_message,
                 on_editor=editor,
+                emoji=self.emoji_index(),
             )
         )
 
@@ -1248,6 +1252,7 @@ class ReviewMixin:
                 post,
                 initial=initial,
                 multiline=True,
+                emoji=True,
                 on_editor=lambda cur: self.edit_text(header, cur, post),
                 hint="Posted right away as a patchset-level comment on every selected change.",
             )

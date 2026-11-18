@@ -72,6 +72,11 @@ class Config:
     syntax_highlight: Any = "auto"  # "auto" (delta if installed), "off" or a command like delta --color-only
     merge_check_interval: int = 600  # seconds between looking up the branch on Gerrit for merge checks (0 = off)
     worktree_dir: Optional[str] = None  # where new worktrees go (default: next to the repository)
+    emoji_completion: bool = True  # :shortcode: suggestions and conversion when writing comments
+    emoji_skin_tone: int = 1  # like Slack's :skin-tone-N:, 1 (none) to 6
+    custom_emoji: dict[str, str] = field(default_factory=dict)  # [custom_emoji] name = "text" or "alias:name"
+    slack_emoji_file: Optional[str] = None  # the workspace's custom emoji as Slack's emoji.list JSON
+    slack_token: Optional[str] = None  # to fetch them from Slack instead (or $LAZYGERRIT_SLACK_TOKEN)
     problems: list[str] = field(default_factory=list)
 
     @property
@@ -169,7 +174,19 @@ def _apply(cfg: Config, data: dict[str, Any]) -> None:
             setattr(cfg, key, value)
 
 
-DISPLAY_SETTINGS = {"diffrenderers", "colorscheme", "syntaxhighlight", "mouse", "sidepanelwidth", "nerdfonts", "diffcontext"}
+DISPLAY_SETTINGS = {
+    "diffrenderers",
+    "colorscheme",
+    "syntaxhighlight",
+    "mouse",
+    "sidepanelwidth",
+    "nerdfonts",
+    "diffcontext",
+    "emojicompletion",
+    "emojiskintone",
+    "customemoji",
+    "slackemojifile",
+}
 
 
 def apply_display_settings(cfg: Config, config_file: Optional[str] = None) -> None:

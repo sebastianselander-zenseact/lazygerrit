@@ -210,6 +210,31 @@ Text prompts and the review dialog: `enter` submits, `alt+enter`/`ctrl+j` insert
 pasting multi-line text works, `ctrl+o` continues in `$EDITOR`, `tab` completes / moves between
 fields. In the review dialog, typing always goes to the message, so text can never change a vote.
 
+**Emoji**: write them like in Slack. In comments, replies and review messages, `:` and two letters
+(`:thu`) list matching emoji. `tab` or `enter` inserts the selected one, `↑`/`↓` choose, `esc` hides
+the list. A whole `:shortcode:` turns into its emoji when you type the closing colon (`backspace`
+right after brings the text back), and `:+1::skin-tone-3:` works too. Text from `ctrl+o`/`$EDITOR`
+gets its shortcodes converted when you save, except inside `` `code` `` and code blocks.
+Gerrit gets real emoji characters, so the web UI shows them as well. The names are Slack's (from
+[emoji-data](https://github.com/iamcal/emoji-data)), favourites like ✅ 👍 🎉 come first, and
+`emoji_skin_tone` picks a default skin tone like Slack's preference does. Your workspace's custom
+emoji are suggested too (see below).
+
+- **Custom emoji of your Slack workspace**: set `slack_token` (or `$LAZYGERRIT_SLACK_TOKEN`) to a
+  Slack token with the `emoji:read` scope. lazygerrit then lists the workspace's emoji with Slack's
+  `emoji.list` API in the background, at most once a day; the list is kept in
+  `~/.cache/lazygerrit/slack-emoji.json`. To keep the token out of the config, save the list once
+  (`curl -H "Authorization: Bearer $TOKEN" https://slack.com/api/emoji.list > ~/slack-emoji.json`)
+  and set `slack_emoji_file` to it instead.
+  Custom emoji that are aliases of standard ones become those emoji. The rest are images, and
+  neither Gerrit nor a terminal can show those, so they're written as their `:name:` and the
+  suggestion list says so.
+- **Your own**: `[custom_emoji]` in the config maps names to any text, or to another emoji with
+  `alias:`, e.g. `lgtm = "alias:white_check_mark"` or `shipit = "🚢 ship it"`.
+- Emoji are drawn so that kitty, tmux and other terminals agree on their width. Sequences that
+  terminals draw differently are simplified on screen (not in what's posted): ❤️ shows as ❤,
+  skin tones are left out, and 👩‍💻 shows as 👩💻.
+
 **Syntax highlighting**: when [delta](https://github.com/dandavison/delta) is installed, the review
 view is syntax highlighted by `delta --color-only`, a mode that only adds colors and keeps the diff
 line for line, so comments and commenting work as usual. Your delta settings apply (e.g.
@@ -296,6 +321,14 @@ color_scheme = "auto"        # dark/light background, for {{colorScheme}} in dif
 syntax_highlight = "auto"    # review view: delta --color-only if delta is installed; "off"; or a command
 merge_check_interval = 600   # seconds between looking up the branch on Gerrit for merge checks (0 = off)
 worktree_dir = "~/git"       # where W creates worktrees (default: next to the repository)
+emoji_completion = true      # :shortcode: suggestions and conversion when writing comments
+emoji_skin_tone = 1          # 1 (none) to 6, like Slack's :skin-tone-N:
+slack_token = "xoxp-…"       # emoji:read, to suggest the workspace's custom emoji
+slack_emoji_file = "~/slack-emoji.json"   # or a saved emoji.list response instead
+
+[custom_emoji]               # your own :names:
+lgtm = "alias:white_check_mark"
+shipit = "🚢 ship it"
 
 [[diff_renderers]]           # optional diff tools, see "Diff tools" above
 command = "delta --paging=never"
@@ -330,7 +363,7 @@ that got new comments or updates (see [Comment threads without REST](#comment-th
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests -t .   # 130+ tests, no network needed
+python3 -m unittest discover -s tests -t .   # 150+ tests, no network needed
 ./bin/lazygerrit --demo                       # play with the UI offline
 ruff check lazygerrit tests
 ```
@@ -343,4 +376,6 @@ queries are exercised end to end.
 Code map: `gerrit.py` (SSH/REST transport, command log, dry-run) · `backend.py` (queries) ·
 `operations.py` (rng semantics, publishing reviews) · `drafts.py` (drafts, reviewed marks) ·
 `ui/review.py` (code review) · `srcrepo.py` (src specifics: CI commands, run-selected jobs,
-priority hashtags) · `parsing.py` (Gerrit JSON, threads, Zuul reports) · `ui/` (curses UI).
+priority hashtags) · `parsing.py` (Gerrit JSON, threads, Zuul reports) · `emoji.py` (Slack emoji
+names, completion, terminal-safe drawing; `scripts/update_emoji_data.py` regenerates the names) ·
+`ui/` (curses UI).
